@@ -19,6 +19,7 @@ from pslpython.predicate import Predicate
 from pslpython.rule import Rule
 
 from scenegraph import SceneGraph
+from utils.episode_logger import EpisodeLogger
 
 import utils.utils_fmm.control_helper as CH
 import utils.utils_fmm.pose_utils as pu
@@ -129,6 +130,14 @@ class SG_Nav_Agent():
         self.co_occur_room_mtx /= self.co_occur_room_mtx.max()
         
         self.scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self)
+        self.debug_sgnav = bool(getattr(self.args, "debug_sgnav", False))
+        self.debug_sgnav_dir = getattr(self.args, "debug_sgnav_dir", "data/debug_sgnav")
+        self.scenegraph.set_debug(self.debug_sgnav, self.debug_sgnav_dir)
+        self.episode_logger = EpisodeLogger(
+            log_dir=self.debug_sgnav_dir,
+            enabled=self.debug_sgnav,
+        )
+        self.episode_logged = False
 
         self.experiment_name = 'experiment_0'
 
@@ -219,6 +228,7 @@ class SG_Nav_Agent():
         self.text_node = ''
         self.text_edge = ''
         self.stop_reason = ''
+        self.episode_logged = False
 
         self.scenegraph.reset()
         
@@ -808,9 +818,45 @@ class SG_Nav_Agent():
         self.metrics['distance_to_goal'] = metrics['distance_to_goal']
         self.metrics['spl'] = metrics['spl']
         self.metrics['softspl'] = metrics['softspl']
+        self.metrics['success'] = metrics.get('success', 0)
         if self.args.visualize:
             if self.simulator._env.episode_over or self.total_steps == 500:
                 self.save_video()
+        if self.simulator._env.episode_over or self.total_steps == 500:
+            self.log_episode_result(metrics)
+
+    def log_episode_result(self, metrics):
+        if getattr(self, "episode_logged", False):
+            return
+        if not getattr(self.episode_logger, "enabled", False):
+            return
+        self.episode_logged = True
+        episode = self.simulator._env.current_episode
+        edges = [edge for edge in self.scenegraph.get_edges() if edge.relation]
+        row = {
+            "episode_idx": self.count_episodes,
+            "episode_id": getattr(episode, "episode_id", ""),
+            "scene_id": getattr(episode, "scene_id", ""),
+            "goal": self.obj_goal,
+            "success": int(metrics.get("success", 0)),
+            "spl": float(metrics.get("spl", 0.0)),
+            "softspl": float(metrics.get("softspl", 0.0)),
+            "distance_to_goal": float(metrics.get("distance_to_goal", 0.0)),
+            "total_steps": int(self.total_steps),
+            "stop_reason": self.stop_reason,
+            "frontier_calls": int(self.fronter_this_ex),
+            "random_goal_count": int(self.random_this_ex),
+            "nodes_final": len(self.scenegraph.get_nodes()),
+            "edges_final": len(edges),
+            "room_nodes_with_groups": sum(
+                1 for room_node in self.scenegraph.room_nodes if len(room_node.group_nodes) > 0
+            ),
+            "goal_detection_count": int(self.found_goal_times),
+            "found_goal": bool(self.found_goal),
+            "found_possible_goal": bool(self.found_possible_goal),
+            "llm_parse_failures": self.scenegraph.debug_stats.summary(),
+        }
+        self.episode_logger.log(row)
 
     def update_visualization_text(self, number_action):
         nodes = self.scenegraph.get_nodes()
@@ -909,8 +955,19 @@ def main():
     parser.add_argument(
         "--num_episodes", default=None, type=int
     )
+    parser.add_argument(
+        "--config",
+        default="configs/challenge_objectnav2021.local.rgbd.yaml",
+        type=str,
+    )
+    parser.add_argument(
+        "--debug_sgnav", action='store_true'
+    )
+    parser.add_argument(
+        "--debug_sgnav_dir", default="data/debug_sgnav", type=str
+    )
     args = parser.parse_args()
-    os.environ["CHALLENGE_CONFIG_FILE"] = "configs/challenge_objectnav2021.local.rgbd.yaml"
+    os.environ["CHALLENGE_CONFIG_FILE"] = args.config
     config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
     config = habitat.get_config(config_paths)
     agent = SG_Nav_Agent(task_config=config, args=args)

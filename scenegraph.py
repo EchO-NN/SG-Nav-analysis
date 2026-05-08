@@ -1,6 +1,8 @@
 import base64
+import json
 import math
 import os
+import re
 from collections import Counter
 from io import BytesIO
 from pathlib import Path, PosixPath
@@ -19,8 +21,18 @@ from GroundingDINO.groundingdino.datasets import transforms as T
 
 from utils.utils_scenegraph.mapping import compute_spatial_similarities, merge_detections_to_objects
 from utils.utils_scenegraph.slam_classes import MapObjectList
-from utils.utils_scenegraph.utils import filter_objects, gobs_to_detection_list, text2value
+from utils.utils_scenegraph.utils import filter_objects, gobs_to_detection_list
 from utils.utils_scenegraph.grounded_sam_demo import get_grounding_output, load_image, load_model
+from utils.llm_parsing import (
+    canonicalize_relation,
+    extract_json,
+    parse_probability_01,
+    parse_relation_lines,
+    parse_room_name,
+    parse_yes_no,
+    strip_thinking,
+)
+from utils.sgnav_debug import SGNavDebugStats
 
 
 ADDITIONAL_PSL_OPTIONS = {
@@ -38,27 +50,55 @@ class VLLMChatClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = os.environ.get("VLLM_API_KEY", "EMPTY")
         self.timeout = float(os.environ.get("VLLM_TIMEOUT", "120"))
-        self.max_tokens = int(os.environ.get("VLLM_MAX_TOKENS", "256"))
-        self.temperature = float(os.environ.get("VLLM_TEMPERATURE", "0"))
+        self.default_max_tokens = int(os.environ.get("VLLM_MAX_TOKENS", "256"))
+        self.default_temperature = float(os.environ.get("VLLM_TEMPERATURE", "0"))
+        self.default_top_p = float(os.environ.get("VLLM_TOP_P", "1.0"))
+        self.seed = int(os.environ.get("VLLM_SEED", "0"))
+        self.disable_thinking = os.environ.get("VLLM_DISABLE_THINKING", "1") not in [
+            "0",
+            "false",
+            "False",
+        ]
 
-    def chat(self, model, messages):
+    def chat(
+        self,
+        model,
+        messages,
+        *,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        request_type="unknown",
+        response_format=None,
+        extra_body=None,
+    ):
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": self.default_temperature if temperature is None else temperature,
+            "top_p": self.default_top_p if top_p is None else top_p,
+            "max_tokens": self.default_max_tokens if max_tokens is None else max_tokens,
+            "seed": self.seed,
+        }
+        if self.disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if response_format is not None:
+            payload["response_format"] = response_format
+        if extra_body:
+            payload.update(extra_body)
+
         response = requests.post(
             f"{self.base_url}/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": model,
-                "messages": messages,
-                "temperature": self.temperature,
-                "max_tokens": self.max_tokens,
-            },
+            json=payload,
             timeout=self.timeout,
         )
         response.raise_for_status()
-        payload = response.json()
-        return payload["choices"][0]["message"]["content"]
+        payload_out = response.json()
+        return payload_out["choices"][0]["message"].get("content", "")
 
 
 class RoomNode():
@@ -188,6 +228,9 @@ class SceneGraph():
         self.reason_visualization = ''
         self.is_navigation = is_navigation
         self.vllm_client = VLLMChatClient()
+        self.debug_enabled = False
+        self.debug_stats = SGNavDebugStats(enabled=False)
+        self.last_debug_print_step = None
         self.llm_name = os.environ.get('VLLM_LLM_MODEL', os.environ.get('VLLM_MODEL', 'qwen3-vl-8b-instruct'))
         self.vlm_name = os.environ.get('VLLM_VLM_MODEL', os.environ.get('VLLM_MODEL', self.llm_name))
         self.seg_xyxy = None
@@ -204,34 +247,35 @@ class SceneGraph():
         self.found_goal_times_threshold = 1
         self.N_max = 10
         self.node_space = 'bathtub. bed. cabinet. chair. drawers. clothes. counter. cushion. fireplace. gym. picture. plant. seating. shower. sink. sofa. stool. table. toilet. towel. tv. treadmill. fitness equipment.'
-        self.prompt_edge_proposal = '''
-Provide the most possible single spatial relationship for each of the following object pairs. Answer with only one relationship per pair, and separate each answer with a newline character. Do not response superfluous text.
-Example 1:
-Input:
-Object pair(s):
-(cabinet, chair)
-Output:
-next to
+        self.prompt_edge_proposal = '''You are an indoor spatial relationship classifier.
+For each object pair, output one short spatial relation.
+Return a JSON array with exactly one object per input pair.
+Each object must have exactly this key: "relationship".
+Do not output markdown or explanation.
+Allowed examples: next to, near, above, on top of, opposite to, below, inside, behind, in front of.
 
-Example 2:
-Input:
-Object pair(s):
-(table, lamp)
-(bed, nightstand)
-Output:
-on
-next to
-
-Now input is: 
-Object pair(s):
-        '''
+Input pairs:
+'''
         self.prompt_relation = 'What is the spatial relationship between the {} and the {} in the image? You can only answer a word or phrase that describes a spatial relationship.'
-        self.prompt_discriminate_relation = 'In the image, do {} and {} satisfy the relationship of {}? Only answer "yes" or "no".'
-        self.prompt_room_predict = 'Which room is the most likely to have the [{}] in: [{}]. Only answer the room.'
-        self.prompt_graph_corr_0 = 'What is the probability of A and B appearing together. [A:{}], [B:{}]. Even if you do not have enough information, you have to answer with a value from 0 to 1 anyway. Answer only the value of probability and do not answer any other text.'
+        self.prompt_discriminate_relation = '''Look at the image.
+Question: Do the {} and {} satisfy the relationship "{}"?
+Return exactly one word: yes or no.'''
+        self.prompt_room_predict = 'Which room is the most likely to have the [{}] in: [{}]. Return exactly one room name and no explanation.'
+        self.prompt_graph_corr_0 = '''Return exactly one decimal number from 0 to 1.
+Do not output words, JSON, markdown, units, or explanation.
+Question: What is the probability of A and B appearing together?
+A: [{}]
+B: [{}]
+Answer:'''
         self.prompt_graph_corr_1 = 'What else do you need to know to determine the probability of A and B appearing together? [A:{}], [B:{}]. Please output a short question (output only one sentence with no additional text).'
         self.prompt_graph_corr_2 = 'Here is the objects and relationships near A: [{}] You answer the following question with a short sentence based on this information. Question: {}'
-        self.prompt_graph_corr_3 = 'The probability of A and B appearing together is about {}. Based on the dialog: [{}], re-determine the probability of A and B appearing together. A:[{}], B:[{}]. Even if you do not have enough information, you have to answer with a value from 0 to 1 anyway. Answer only the value of probability and do not answer any other text.'
+        self.prompt_graph_corr_3 = '''Return exactly one decimal number from 0 to 1.
+Do not output words, JSON, markdown, units, or explanation.
+Initial probability: {}
+Dialog: [{}]
+A: [{}]
+B: [{}]
+Final probability:'''
         self.mask_generator = self.get_sam_mask_generator(self.sam_variant, self.device)
         self.set_cfg()
         self.set_agent(agent)
@@ -252,6 +296,7 @@ Object pair(s):
         self.edge_text = ''
         self.edge_list = []
         self.reason_visualization = ''
+        self.last_debug_print_step = None
 
     def set_cfg(self):
         cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': 'cuda', 'use_iou': True, 'spatial_sim_type': 'overlap', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.025, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 10, 'obj_min_points': 0, 'obj_min_detections': 3, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
@@ -263,6 +308,10 @@ Object pair(s):
 
     def set_agent(self, agent):
         self.agent = agent
+
+    def set_debug(self, enabled=False, log_dir="data/debug_sgnav"):
+        self.debug_enabled = enabled
+        self.debug_stats = SGNavDebugStats(log_dir=log_dir, enabled=enabled)
 
     def set_obj_goal(self, obj_goal, obj_goal_sg):
         self.obj_goal = obj_goal
@@ -687,15 +736,19 @@ Object pair(s):
             return
         # create the edge between new_node and old_node
         new_edges = []
+        created_count = 0
         for i, new_node in enumerate(new_nodes):
             for j, old_node in enumerate(old_nodes):
                 new_edge = Edge(new_node, old_node)
                 new_edges.append(new_edge)
+                created_count += 1
         # create the edge between new_node
         for i, new_node1 in enumerate(new_nodes):
             for j, new_node2 in enumerate(new_nodes[i + 1:]):
                 new_edge = Edge(new_node1, new_node2)
                 new_edges.append(new_edge)
+                created_count += 1
+        self.debug_stats.inc("edges_created", created_count)
         # get all new_edges
         new_edges = set()
         for i, node in enumerate(self.nodes):
@@ -706,9 +759,13 @@ Object pair(s):
             image = self.get_joint_image(new_edge.node1, new_edge.node2)
             if image is not None:
                 prompt = self.prompt_relation.format(new_edge.node1.caption, new_edge.node2.caption)
-                response = self.get_vlm_response(prompt=prompt, image=image)
-                response = response.replace('.', '').lower()
-                new_edge.set_relation(response)
+                response = self.get_vlm_response(
+                    prompt=prompt,
+                    image=image,
+                    request_type="relation_from_image",
+                    max_tokens=16,
+                )
+                new_edge.set_relation(canonicalize_relation(response))
         new_edges = set()
         for i, node in enumerate(self.nodes):
             node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
@@ -716,22 +773,44 @@ Object pair(s):
         new_edges = list(new_edges)
         # get all relation proposals
         if len(new_edges) > 0:
-            node_pairs = []
-            for new_edge in new_edges:
-                node_pairs.append(new_edge.node1.caption)
-                node_pairs.append(new_edge.node2.caption)
-            prompt = self.prompt_edge_proposal + '\n({}, {})' * len(new_edges)
-            prompt = prompt.format(*node_pairs)
-            relations = self.get_llm_response(prompt=prompt)
-            relations = relations.split('\n')
-            if len(relations) == len(new_edges):
+            pairs = [
+                {"object1": edge.node1.caption, "object2": edge.node2.caption}
+                for edge in new_edges
+            ]
+            prompt = self.prompt_edge_proposal + json.dumps(pairs, ensure_ascii=False)
+            self.debug_stats.inc("edge_proposal_total")
+            raw = self.get_llm_response(
+                prompt=prompt,
+                request_type="edge_proposal",
+                max_tokens=max(64, 8 * len(new_edges)),
+            )
+            relations = parse_relation_lines(raw, expected_n=len(new_edges))
+            if relations is None:
+                self.debug_stats.inc("edge_proposal_parse_fail")
+                self.debug_stats.inc("edge_relation_mismatch")
+                self.debug_stats.log_response(
+                    request_type="edge_proposal_parse_fail",
+                    prompt=prompt,
+                    response=raw,
+                    meta={"expected_n": len(new_edges)},
+                )
+            else:
                 for i, relation in enumerate(relations):
                     new_edges[i].set_relation(relation)
             # discriminate all relation proposals
             self.free_map = self.fbe_free_map.cpu().numpy()[0,0,::-1].copy() > 0.5
+            none_count = sum(edge.relation is None for edge in new_edges)
+            if none_count > 0:
+                self.debug_stats.inc("edge_none_relation", none_count)
             for i, new_edge in enumerate(new_edges):
-                if new_edge.relation == None or not self.discriminate_relation(new_edge):
+                if new_edge.relation is None:
+                    self.debug_stats.inc("edges_deleted")
                     new_edge.delete()
+                elif not self.discriminate_relation(new_edge):
+                    self.debug_stats.inc("edges_deleted")
+                    new_edge.delete()
+                else:
+                    self.debug_stats.inc("edges_kept")
 
     def update_group(self):
         for room_node in self.room_nodes:
@@ -751,6 +830,7 @@ Object pair(s):
                     room_node.group_nodes.append(group_node)
 
     def insert_goal(self, goal=None):
+        self.debug_stats.inc("insert_goal_total")
         if goal is None:
             goal = self.obj_goal_sg
         self.update_group()
@@ -760,22 +840,57 @@ Object pair(s):
                 room_node_text = room_node_text + room_node.caption + ','
         # room_node_text[-2] = '.'
         if room_node_text == '':
+            self.debug_stats.inc("insert_goal_none")
             return None
         prompt = self.prompt_room_predict.format(goal, room_node_text)
-        response = self.get_llm_response(prompt=prompt)
-        response = response.lower()
+        self.debug_stats.inc("room_predict_total")
+        response = self.get_llm_response(
+            prompt=prompt,
+            request_type="room_predict",
+            max_tokens=16,
+        )
+        room_name = parse_room_name(response, [room_node.caption for room_node in self.room_nodes])
         predict_room_node = None
-        for room_node in self.room_nodes:
-            if len(room_node.group_nodes) > 0 and room_node.caption.lower() in response:
-                predict_room_node = room_node
+        if room_name is not None:
+            for room_node in self.room_nodes:
+                if room_node.caption == room_name and len(room_node.group_nodes) > 0:
+                    predict_room_node = room_node
+                    break
         if predict_room_node is None:
-            return None
+            self.debug_stats.inc("room_predict_parse_fail")
+            self.debug_stats.log_response(
+                request_type="room_predict_parse_fail",
+                prompt=prompt,
+                response=response,
+                meta={"available_rooms": room_node_text},
+            )
+            predict_room_node = self.fallback_room_by_cooccurrence()
+            if predict_room_node is None:
+                self.debug_stats.inc("insert_goal_none")
+                return None
         for group_node in predict_room_node.group_nodes:
             corr_score = self.graph_corr(goal, group_node)
             group_node.corr_score = corr_score
         sorted_group_nodes = sorted(predict_room_node.group_nodes)
         self.mid_term_goal = sorted_group_nodes[-1].center
+        self.debug_stats.inc("insert_goal_success")
         return self.mid_term_goal
+
+    def fallback_room_by_cooccurrence(self):
+        if not hasattr(self.agent, "prob_array_room"):
+            return None
+        best_node = None
+        best_score = -1e9
+        for idx, room_node in enumerate(self.room_nodes):
+            if len(room_node.group_nodes) == 0:
+                continue
+            score = 0.0
+            if idx < len(self.agent.prob_array_room):
+                score = float(self.agent.prob_array_room[idx])
+            if score > best_score:
+                best_score = score
+                best_node = room_node
+        return best_node
     
     def update_scenegraph(self):
         print(f'Navigate Step: {self.navigate_steps}', end='\r')
@@ -785,36 +900,89 @@ Object pair(s):
             self.get_caption()
             self.update_node()
             self.update_edge()
+        if (
+            self.debug_enabled
+            and self.navigate_steps % 20 == 0
+            and self.last_debug_print_step != self.navigate_steps
+        ):
+            print("[SGNAV_DEBUG]", self.debug_stats.summary())
+            self.last_debug_print_step = self.navigate_steps
     
-    def get_llm_response(self, prompt):
-        return self.vllm_client.chat(
+    def get_llm_response(
+        self,
+        prompt,
+        request_type="llm",
+        max_tokens=None,
+        response_format=None,
+        extra_body=None,
+    ):
+        self.debug_stats.inc("llm_calls_total")
+        system = {
+            "role": "system",
+            "content": (
+                "You are a strict parser-friendly assistant for a robotics "
+                "navigation system. Follow the requested output format exactly. "
+                "Do not output markdown, explanation, or hidden reasoning."
+            ),
+        }
+        response = self.vllm_client.chat(
             model=self.llm_name,
-            messages=[{
-                'role': 'user',
-                'content': prompt,
-            }]
+            messages=[
+                system,
+                {
+                    'role': 'user',
+                    'content': prompt,
+                },
+            ],
+            request_type=request_type,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            response_format=response_format,
+            extra_body=extra_body,
         )
+        self.debug_stats.log_response(request_type, prompt, response)
+        return response
     
-    def get_vlm_response(self, prompt, image):
+    def get_vlm_response(self, prompt, image, request_type="vlm", max_tokens=None):
         buffered = BytesIO()
         image.save(buffered, format='PNG')
         image_bytes = base64.b64encode(buffered.getvalue())
         image_str = str(image_bytes, 'utf-8')
-        return self.vllm_client.chat(
+        self.debug_stats.inc("vlm_calls_total")
+        system = {
+            "role": "system",
+            "content": "You are a strict visual classifier. Return only the requested short answer.",
+        }
+        response = self.vllm_client.chat(
             model=self.vlm_name,
-            messages=[{
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': prompt},
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{image_str}'
+            messages=[
+                system,
+                {
+                    'role': 'user',
+                    'content': [
+                        {
+                            'type': 'image_url',
+                            'image_url': {
+                                'url': f'data:image/png;base64,{image_str}'
+                            },
                         },
-                    },
-                ],
-            }]
+                        {'type': 'text', 'text': prompt},
+                    ],
+                },
+            ],
+            request_type=request_type,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            top_p=1.0,
         )
+        self.debug_stats.log_response(
+            request_type,
+            prompt,
+            response,
+            meta={"has_image": True},
+        )
+        return response
         
     def find_modes(self, lst):  
         if len(lst) == 0:
@@ -873,38 +1041,52 @@ Object pair(s):
         if predict_goal_xy is not None:
             predict_goal_xy = np.array(predict_goal_xy).reshape(1, 2)
             distance = np.linalg.norm(predict_goal_xy - frontier_locations_16, axis=1)
-            score = np.tile(1, (num_16_frontiers))
+            score = np.ones((num_16_frontiers,), dtype=np.float32)
             score[distance > 32] = 0
-            score = score / distance
+            score = score / np.maximum(distance, 1.0)
             scores += score
-        return scores
+        return np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=-1e6)
 
     def discriminate_relation(self, edge):
+        self.debug_stats.inc("discriminate_total")
         image = self.get_joint_image(edge.node1, edge.node2)
         if image is not None:
-            response = self.get_vlm_response(self.prompt_discriminate_relation.format(edge.node1.caption, edge.node2.caption, edge.relation), image)
-            if 'yes' in response.lower():
-                return True
-            else:
-                return False
+            response = self.get_vlm_response(
+                self.prompt_discriminate_relation.format(
+                    edge.node1.caption,
+                    edge.node2.caption,
+                    edge.relation,
+                ),
+                image,
+                request_type="discriminate_relation",
+                max_tokens=8,
+            )
+            accepted = parse_yes_no(response, default=False)
+            self.debug_stats.inc("discriminate_yes" if accepted else "discriminate_no")
+            return accepted
         else:
             if edge.node1.room_node != edge.node2.room_node:
+                self.debug_stats.inc("discriminate_no")
                 return False
             x1, y1 = edge.node1.center
             x2, y2 = edge.node2.center
             distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
             if distance > self.map_size // 40:
+                self.debug_stats.inc("discriminate_no")
                 return False
             alpha = math.atan2(y2 - y1, x2 - x1)  
             sin_2alpha = 2 * math.sin(alpha) * math.cos(alpha)
             if not -0.05 < sin_2alpha < 0.05:
+                self.debug_stats.inc("discriminate_no")
                 return False
             n = 3
             for i in range(1, n):
                 x = int(x1 + (x2 - x1) * i / n)
                 y = int(y1 + (y2 - y1) * i / n)
                 if not self.free_map[y, x]:
+                    self.debug_stats.inc("discriminate_no")
                     return False
+            self.debug_stats.inc("discriminate_yes")
             return True
         
     def perception(self):
@@ -916,12 +1098,66 @@ Object pair(s):
 
     def graph_corr(self, goal, graph):
         prompt = self.prompt_graph_corr_0.format(graph.center_node.caption, goal)
-        response_0 = self.get_llm_response(prompt=prompt)
+        response_0 = self.get_llm_response(
+            prompt=prompt,
+            request_type="graph_corr_probability",
+            max_tokens=16,
+        )
+        initial_probability = self.parse_probability_response(
+            response_0,
+            prompt,
+            "graph_corr_probability",
+        )
         prompt = self.prompt_graph_corr_1.format(graph.center_node.caption, goal)
-        response_1 = self.get_llm_response(prompt=prompt)
+        response_1 = self.get_llm_response(
+            prompt=prompt,
+            request_type="graph_corr_question",
+            max_tokens=64,
+        )
         prompt = self.prompt_graph_corr_2.format(graph.caption, response_1)
-        response_2 = self.get_llm_response(prompt=prompt)
-        prompt = self.prompt_graph_corr_3.format(response_0, response_1 + response_2, graph.center_node.caption, goal)
-        response_3 = self.get_llm_response(prompt=prompt)
-        corr_score = text2value(response_3)
+        response_2 = self.get_llm_response(
+            prompt=prompt,
+            request_type="graph_corr_answer",
+            max_tokens=96,
+        )
+        prompt = self.prompt_graph_corr_3.format(
+            f"{initial_probability:.3f}",
+            response_1 + response_2,
+            graph.center_node.caption,
+            goal,
+        )
+        response_3 = self.get_llm_response(
+            prompt=prompt,
+            request_type="graph_corr_final",
+            max_tokens=16,
+        )
+        corr_score = self.parse_probability_response(
+            response_3,
+            prompt,
+            "graph_corr_final",
+        )
         return corr_score
+
+    def parse_probability_response(self, response, prompt, request_type):
+        self.debug_stats.inc("probability_parse_total")
+        value = parse_probability_01(response, default=0.0)
+        if self.probability_parse_failed(response):
+            self.debug_stats.inc("probability_parse_fail")
+            self.debug_stats.log_response(
+                request_type=f"{request_type}_parse_fail",
+                prompt=prompt,
+                response=response,
+            )
+        return value
+
+    def probability_parse_failed(self, response):
+        text = strip_thinking(response)
+        data = extract_json(text)
+        if isinstance(data, (int, float)):
+            return False
+        if isinstance(data, dict):
+            for key in ["probability", "score", "value", "p", "answer"]:
+                if key in data:
+                    return self.probability_parse_failed(str(data[key]))
+            return True
+        return re.search(r"[-+]?\d*\.\d+|[-+]?\d+", text.replace("%", "")) is None
