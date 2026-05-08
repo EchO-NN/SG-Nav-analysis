@@ -108,17 +108,34 @@ wget https://huggingface.co/GLIPModel/GLIP/resolve/main/glip_large_model.pth
 cd ../../
 ```
 
-Install Ollama.
+Run an OpenAI-compatible vLLM server for LLM/VLM calls. This project keeps vLLM in
+its own mamba env (`.mamba/envs/sg-nav-vllm`) because vLLM needs a newer PyTorch
+than the SG-Nav/GLIP runtime.
 ```
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull llama3.2-vision
+./run_vllm.sh
+```
+By default `run_vllm.sh` serves `Qwen/Qwen3-VL-8B-Instruct` under the OpenAI API
+model name `qwen3-vl-8b-instruct`. SG-Nav connects to
+`http://127.0.0.1:8000/v1` and uses that served name. You can override this with
+`VLLM_HF_MODEL`, `VLLM_BASE_URL`, `VLLM_MODEL`, `VLLM_LLM_MODEL`,
+`VLLM_VLM_MODEL`, `VLLM_SERVED_MODEL_NAME`, `VLLM_MAX_MODEL_LEN`,
+`VLLM_GPU_MEMORY_UTILIZATION`, `VLLM_LIMIT_MM_PER_PROMPT`,
+`VLLM_ENFORCE_EAGER`, and `VLLM_ENABLE_PREFIX_CACHING`. The default vLLM memory
+settings are tuned to leave room for SG-Nav's GLIP/SAM/GroundingDINO models on
+the same 48 GB GPU. CUDA graph and prefix caching are disabled by default because
+Qwen3-VL deepstack requests can otherwise fail on image prompts with padded token
+counts.
+
+Check the local setup before running:
+```
+./check_setup.py
 ```
 
 ## Evaluation
 
 Run SG-Nav:
 ```
-python SG_Nav.py --visualize
+./run_sg_nav.sh --visualize
 ```
 
 ## Citation

@@ -18,10 +18,19 @@ from maskrcnn_benchmark.modeling.roi_heads.mask_head.inference import Masker
 from maskrcnn_benchmark.utils import cv2_util
 
 engine = inflect.engine()
-nltk.download('punkt')
-nltk.download('punkt_tab')
-nltk.download('averaged_perceptron_tagger')
-nltk.download('averaged_perceptron_tagger_eng')
+
+
+def _ensure_nltk_resource(package, resource):
+    try:
+        nltk.data.find(resource)
+    except LookupError:
+        nltk.download(package)
+
+
+_ensure_nltk_resource('punkt', 'tokenizers/punkt')
+_ensure_nltk_resource('punkt_tab', 'tokenizers/punkt_tab')
+_ensure_nltk_resource('averaged_perceptron_tagger', 'taggers/averaged_perceptron_tagger')
+_ensure_nltk_resource('averaged_perceptron_tagger_eng', 'taggers/averaged_perceptron_tagger_eng')
 
 import timeit
 

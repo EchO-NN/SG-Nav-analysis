@@ -7,9 +7,9 @@ from pathlib import Path, PosixPath
 import cv2
 import numpy as np
 import omegaconf
+import requests
 import supervision as sv
 import torch
-import ollama
 from omegaconf import DictConfig
 from PIL import Image
 from sklearn.cluster import DBSCAN
@@ -30,6 +30,35 @@ ADDITIONAL_PSL_OPTIONS = {
 ADDITIONAL_CLI_OPTIONS = [
     # '--postgres'
 ]
+
+
+class VLLMChatClient:
+    def __init__(self):
+        base_url = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
+        self.base_url = base_url.rstrip("/")
+        self.api_key = os.environ.get("VLLM_API_KEY", "EMPTY")
+        self.timeout = float(os.environ.get("VLLM_TIMEOUT", "120"))
+        self.max_tokens = int(os.environ.get("VLLM_MAX_TOKENS", "256"))
+        self.temperature = float(os.environ.get("VLLM_TEMPERATURE", "0"))
+
+    def chat(self, model, messages):
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload["choices"][0]["message"]["content"]
 
 
 class RoomNode():
@@ -158,8 +187,9 @@ class SceneGraph():
         self.init_room_nodes()
         self.reason_visualization = ''
         self.is_navigation = is_navigation
-        self.llm_name = 'llama3.2-vision'
-        self.vlm_name = 'llama3.2-vision'
+        self.vllm_client = VLLMChatClient()
+        self.llm_name = os.environ.get('VLLM_LLM_MODEL', os.environ.get('VLLM_MODEL', 'qwen3-vl-8b-instruct'))
+        self.vlm_name = os.environ.get('VLLM_VLM_MODEL', os.environ.get('VLLM_MODEL', self.llm_name))
         self.seg_xyxy = None
         self.seg_caption = None
         
@@ -757,29 +787,34 @@ Object pair(s):
             self.update_edge()
     
     def get_llm_response(self, prompt):
-        response = ollama.chat(
+        return self.vllm_client.chat(
             model=self.llm_name,
             messages=[{
                 'role': 'user',
                 'content': prompt,
             }]
         )
-        return response.message.content
     
     def get_vlm_response(self, prompt, image):
         buffered = BytesIO()
         image.save(buffered, format='PNG')
         image_bytes = base64.b64encode(buffered.getvalue())
         image_str = str(image_bytes, 'utf-8')
-        response = ollama.chat(
+        return self.vllm_client.chat(
             model=self.vlm_name,
             messages=[{
                 'role': 'user',
-                'content': prompt,
-                'images': [image_str]
+                'content': [
+                    {'type': 'text', 'text': prompt},
+                    {
+                        'type': 'image_url',
+                        'image_url': {
+                            'url': f'data:image/png;base64,{image_str}'
+                        },
+                    },
+                ],
             }]
         )
-        return response.message.content
         
     def find_modes(self, lst):  
         if len(lst) == 0:

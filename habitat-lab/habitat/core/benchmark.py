@@ -160,6 +160,8 @@ class Benchmark:
 
             metrics = self._env.get_metrics()
             metrics['goal'] = agent.obj_goal
+            metrics['steps'] = agent.total_steps
+            metrics['stop_reason'] = getattr(agent, 'stop_reason', '')
             all_metrics.append(metrics)
             metrics = self._env.get_metrics()
             print(count_episodes, metrics)

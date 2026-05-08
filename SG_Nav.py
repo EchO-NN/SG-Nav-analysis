@@ -10,8 +10,8 @@ import skimage
 import torch
 import habitat
 
-from GLIP.maskrcnn_benchmark.config import cfg as glip_cfg
-from GLIP.maskrcnn_benchmark.engine.predictor_glip import GLIPDemo
+from maskrcnn_benchmark.config import cfg as glip_cfg
+from maskrcnn_benchmark.engine.predictor_glip import GLIPDemo
 
 from pslpython.model import Model as PSLModel
 from pslpython.partition import Partition
@@ -218,6 +218,7 @@ class SG_Nav_Agent():
         self.explanation = ''
         self.text_node = ''
         self.text_edge = ''
+        self.stop_reason = ''
 
         self.scenegraph.reset()
         
@@ -355,6 +356,7 @@ class SG_Nav_Agent():
                         
     def act(self, observations):
         if self.total_steps >= 500:
+            self.stop_reason = 'max_episode_steps'
             return {"action": 0}
         
         self.total_steps += 1
@@ -487,13 +489,22 @@ class SG_Nav_Agent():
             self.loop_time += 1
             self.random_this_ex += 1
             if self.loop_time > 20:
+                self.stop_reason = 'no_valid_plan_after_random_retries'
                 return {"action": 0}
             self.not_move_steps = 0
             self.goal_map = self.set_random_goal()
             self.using_random_goal = True
             stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
         
+        if number_action == 0:
+            if self.found_goal:
+                self.stop_reason = 'planner_stop_after_found_goal'
+            else:
+                self.stop_reason = 'planner_stop_without_confirmed_goal'
+        else:
+            self.stop_reason = 'running'
         if self.args.visualize:
+            self.update_visualization_text(number_action)
             self.visualize(traversible, observations, number_action)
 
         observations["pointgoal_with_gps_compass"] = self.get_relative_goal_gps(observations)
@@ -801,6 +812,25 @@ class SG_Nav_Agent():
             if self.simulator._env.episode_over or self.total_steps == 500:
                 self.save_video()
 
+    def update_visualization_text(self, number_action):
+        nodes = self.scenegraph.get_nodes()
+        edges = [edge for edge in self.scenegraph.get_edges() if edge.relation]
+        self.text_node = "\n".join(
+            f"{idx + 1}. {node.caption}"
+            for idx, node in enumerate(nodes)
+            if node.caption
+        )
+        self.text_edge = "\n".join(edge.text() for edge in edges)
+        goal_state = "found" if self.found_goal else "possible" if self.found_possible_goal else "exploring"
+        nav_target = "random" if self.using_random_goal else "frontier"
+        self.explanation = (
+            f"Step {self.total_steps}, action {number_action}, goal {self.obj_goal}: "
+            f"{goal_state}. Current navigation target: {nav_target}. "
+            f"Stop reason: {self.stop_reason}. "
+            f"Distance to goal: {self.metrics['distance_to_goal']:.2f}, "
+            f"SPL: {self.metrics['spl']:.2f}, SoftSPL: {self.metrics['softspl']:.2f}."
+        )
+
     def visualize(self, traversible, observations, number_action):
         if self.args.visualize:
             save_map = copy.deepcopy(torch.from_numpy(traversible))
@@ -838,6 +868,8 @@ class SG_Nav_Agent():
             self.visualize_image_list.append(visualize_image)
 
     def save_video(self):
+        if len(self.visualize_image_list) == 0:
+            return
         save_video_dir = os.path.join(self.visualization_dir, 'video')
         save_video_path = f'{save_video_dir}/vid_{self.count_episodes:06d}.mp4'
         if not os.path.exists(save_video_dir):
@@ -845,6 +877,8 @@ class SG_Nav_Agent():
         height, width, layers = self.visualize_image_list[0].shape
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video = cv2.VideoWriter(save_video_path, fourcc, 4.0, (width, height))
+        if not video.isOpened():
+            raise RuntimeError(f"Failed to open video writer: {save_video_path}")
         for visualize_image in self.visualize_image_list:  
             video.write(visualize_image)
         video.release()
@@ -872,6 +906,9 @@ def main():
     parser.add_argument(
         "--split_r", default=11, type=int
     )
+    parser.add_argument(
+        "--num_episodes", default=None, type=int
+    )
     args = parser.parse_args()
     os.environ["CHALLENGE_CONFIG_FILE"] = "configs/challenge_objectnav2021.local.rgbd.yaml"
     config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
@@ -880,7 +917,7 @@ def main():
 
     challenge = habitat.Challenge(eval_remote=False, split_l=args.split_l, split_r=args.split_r)
 
-    challenge.submit(agent)
+    challenge.submit(agent, num_episodes=args.num_episodes)
 
 
 if __name__ == "__main__":
