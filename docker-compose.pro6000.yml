@@ -1,0 +1,52 @@
+name: sgnav-pro6000
+
+services:
+  vllm:
+    image: ${SGNAV_IMAGE:-sgnav-pro6000:latest}
+    command: ["vllm"]
+    gpus: all
+    ipc: host
+    shm_size: "16gb"
+    ports:
+      - "8000:8000"
+    environment:
+      VLLM_HOST: 0.0.0.0
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.65}
+      VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-8192}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+
+  sg-nav:
+    image: ${SGNAV_IMAGE:-sgnav-pro6000:latest}
+    command:
+      - sg-nav
+      - --split_l
+      - "0"
+      - --split_r
+      - "1"
+      - --num_episodes
+      - "1"
+      - --debug_sgnav
+      - --debug_sgnav_dir
+      - data/debug_sgnav/docker
+      - --reperception_min_observations
+      - "4"
+      - --reperception_threshold
+      - "1.2"
+      - --reperception_max_steps
+      - "12"
+      - --found_goal_stop_distance_m
+      - "0.35"
+    depends_on:
+      - vllm
+    gpus: all
+    ipc: host
+    shm_size: "16gb"
+    environment:
+      VLLM_BASE_URL: http://vllm:8000/v1
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+    volumes:
+      - ./docker_outputs/results:/home/echo/SG-Nav/data/results
+      - ./docker_outputs/debug_sgnav:/home/echo/SG-Nav/data/debug_sgnav
+      - ./docker_outputs/visualization:/home/echo/SG-Nav/data/visualization

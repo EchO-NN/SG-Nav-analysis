@@ -1,0 +1,27 @@
+name: sg-nav
+channels:
+  - aihabitat
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - setuptools
+  - wheel
+  - cudatoolkit=11.8
+  - habitat-sim=0.2.4
+  - habitat-sim-mutex=1.0=display_nobullet
+  - faiss-gpu=1.8.0
+  - numpy=1.26
+  - scipy=1.13
+  - matplotlib-base=3.3.2
+  - pillow=9.5
+  - numba=0.60
+  - llvmlite=0.43
+  - quaternion
+  - imageio
+  - imageio-ffmpeg
+  - ffmpeg
+  - tqdm
+  - gitpython
+  - ca-certificates
+  - openssl

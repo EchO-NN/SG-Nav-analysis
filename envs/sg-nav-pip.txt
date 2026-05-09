@@ -1,0 +1,41 @@
+--extra-index-url https://download.pytorch.org/whl/cu111
+
+torch==1.9.1+cu111
+torchvision==0.10.1+cu111
+
+transformers==4.30.0
+tokenizers==0.13.3
+pslpython==2.3.3
+yacs==0.1.8
+open3d==0.19.0
+requests==2.32.5
+scikit-image==0.24.0
+scikit-learn==1.6.1
+scikit-fmm==2025.1.29
+pandas==2.3.3
+omegaconf==2.3.0
+nltk==3.9.2
+inflect==7.5.0
+einops==0.8.2
+prettytable==3.16.0
+ftfy==6.3.1
+timm==0.6.13
+pycocotools==2.0.11
+supervision==0.27.0.post2
+opencv-python==4.11.0.86
+fvcore==0.1.5.post20221221
+iopath==0.1.10
+portalocker==3.2.0
+ConfigArgParse==1.7.5
+gym==0.26.2
+pyquaternion==0.9.9
+ollama==0.6.2
+huggingface_hub==0.36.2
+safetensors==0.7.0
+
+git+https://github.com/facebookresearch/pytorch3d.git@9585a58d10cb2efcd159b058fa4af914203c1d0d
+
+-e ./habitat-lab
+-e ./GroundingDINO
+-e ./segment_anything
+-e ./GLIP
