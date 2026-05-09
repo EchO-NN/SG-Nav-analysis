@@ -1,0 +1,6 @@
+run_id,split,method,label_type,top1,top3,chosen_cost,best_cost,cost_ratio,teacher_agreement,label_entropy,num_frontiers_mean,num_objects_mean,notes
+placeholder,val,random,--,--,--,--,--,--,--,--,--,--,placeholder
+placeholder,val,distance,--,--,--,--,--,--,--,--,--,--,placeholder
+placeholder,val,teacher,--,--,--,--,--,--,--,--,--,--,placeholder
+placeholder,val,gnn,--,--,--,--,--,--,--,--,--,--,placeholder
+

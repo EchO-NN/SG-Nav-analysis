@@ -1,0 +1,10 @@
+variant,benchmark,SR,SPL,latency_ms,notes
+Full SparseGNN-Nav,MP3D,--,--,--,placeholder
+No frontier node,MP3D,--,--,--,placeholder
+No goal node,MP3D,--,--,--,placeholder
+No room node,MP3D,--,--,--,placeholder
+No frontier-object edges,MP3D,--,--,--,placeholder
+No hindsight relabeling,MP3D,--,--,--,placeholder
+Teacher distillation only,MP3D,--,--,--,placeholder
+No fallback,MP3D,--,--,--,placeholder
+

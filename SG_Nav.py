@@ -155,6 +155,16 @@ class SG_Nav_Agent():
             enabled=self.debug_sgnav,
         )
         self.episode_logged = False
+        self.gnn_graph_builder = None
+        self.gnn_scorer = None
+        self.gnn_logger = None
+        self.gnn_raw_logger = None
+        if (
+            bool(getattr(self.args, "use_gnn_nav", False))
+            or bool(getattr(self.args, "gnn_log", False))
+            or bool(getattr(self.args, "collect_gnn_data", False))
+        ):
+            self.init_gnn_nav_modules()
 
         self.experiment_name = 'experiment_0'
 
@@ -186,6 +196,51 @@ class SG_Nav_Agent():
         model.add_rule(Rule('2: !RoomCooccur(R) & IsNearRoom(R,F) -> !Choose(F)^2'))
         model.add_rule(Rule('2: ShortDist(F) -> Choose(F)^2'))
         model.add_rule(Rule('Choose(+F) = 1 .'))
+
+    def init_gnn_nav_modules(self):
+        from gnn_data.raw_logger import GNNRawLogger
+
+        self.gnn_raw_logger = GNNRawLogger(
+            log_dir=getattr(self.args, "gnn_raw_log_dir", "data/gnn_raw/mp3d/train"),
+            enabled=bool(getattr(self.args, "collect_gnn_data", False)),
+            collect_every_k_fbe=getattr(self.args, "gnn_collect_every_k_fbe", 1),
+            data_tag=getattr(self.args, "gnn_data_tag", "sgnav_teacher"),
+        )
+
+        if bool(getattr(self.args, "use_gnn_nav", False)) or bool(getattr(self.args, "gnn_log", False)):
+            from gnn_nav.replay_logger import GNNReplayLogger
+            from gnn_nav.scorer import GNNFrontierScorer
+            from gnn_nav.sparse_graph_builder import DEFAULT_ROOM_NAMES, SparseDecisionGraphBuilder
+            from gnn_nav.text_encoder import TextEmbeddingCache
+
+            self.gnn_text_encoder = TextEmbeddingCache(
+                cache_path="data/gnn/text_embeddings.pt",
+                dim=int(getattr(self.args, "gnn_text_dim", 384)),
+                device="cpu",
+            )
+            room_names = getattr(self.scenegraph, "rooms", DEFAULT_ROOM_NAMES)
+            self.gnn_graph_builder = SparseDecisionGraphBuilder(
+                text_encoder=self.gnn_text_encoder,
+                map_resolution_cm=self.map_resolution,
+                map_size=self.map_size,
+                room_names=room_names,
+                max_objects=100,
+                object_knn_k=6,
+                frontier_knn_k=8,
+                object_radius_m=2.5,
+                frontier_radius_m=4.0,
+                device="cpu",
+            )
+            self.gnn_scorer = GNNFrontierScorer(
+                checkpoint_path=getattr(self.args, "gnn_ckpt", None),
+                builder=self.gnn_graph_builder,
+                device=str(self.device),
+                fallback_to_distance=True,
+            )
+            self.gnn_logger = GNNReplayLogger(
+                log_dir=getattr(self.args, "gnn_log_dir", "data/gnn_replay/mp3d/train"),
+                enabled=bool(getattr(self.args, "gnn_log", False)),
+            )
     
     def reset(self):
         self.navigate_steps = 0
@@ -818,6 +873,174 @@ class SG_Nav_Agent():
         else:
             new_labels = ['object' for i in labels]
         return new_labels
+
+    def get_gnn_frontier_clusters(self, frontier_map, fmm_dist_m):
+        from gnn_nav.frontier_clustering import cluster_frontiers
+
+        if hasattr(frontier_map, "detach"):
+            frontier_np = frontier_map.detach().cpu().numpy()
+        else:
+            frontier_np = np.asarray(frontier_map)
+        fmm_dist_np = np.asarray(fmm_dist_m, dtype=np.float32)
+        if fmm_dist_np.shape != frontier_np.shape:
+            raise ValueError(
+                f"GNN frontier shape mismatch: frontier={frontier_np.shape}, fmm_dist={fmm_dist_np.shape}"
+            )
+        return cluster_frontiers(
+            frontier_map=frontier_np,
+            fmm_dist=fmm_dist_np,
+            min_path_dist=1.6,
+            max_frontiers=int(getattr(self.args, "gnn_max_frontiers", 32)),
+        )
+
+    def get_gnn_episode_metadata(self):
+        episode = None
+        try:
+            episode = self.simulator._env.current_episode
+        except Exception:
+            episode = None
+        return {
+            "scene_id": getattr(episode, "scene_id", "unknown_scene"),
+            "episode_id": getattr(episode, "episode_id", "unknown_episode"),
+            "step_id": int(getattr(self, "total_steps", 0)),
+            "goal_text": getattr(self, "obj_goal_sg", ""),
+            "agent_pose": self.full_pose.detach().cpu() if hasattr(self.full_pose, "detach") else self.full_pose,
+            "map_size": int(self.map_size),
+            "map_resolution_cm": float(self.map_resolution),
+        }
+
+    def log_gnn_raw_sample(
+        self,
+        frontier_map,
+        fmm_dist,
+        frontier_locations_all_rc,
+        frontier_locations_valid_rc,
+        valid_indices_in_all,
+        distances_valid,
+        distance_inverse_valid,
+        scenegraph_scores,
+        distance_bias,
+        total_scores,
+        selected_valid_idx,
+        selected_all_idx,
+        selected_goal_rc,
+    ):
+        if self.gnn_raw_logger is None or not bool(getattr(self.args, "collect_gnn_data", False)):
+            return
+        try:
+            from gnn_data.extract_sgnav_state import build_raw_sgnav_step_sample
+
+            sample = build_raw_sgnav_step_sample(
+                agent=self,
+                frontier_map=frontier_map,
+                fmm_dist=fmm_dist,
+                frontier_locations_all_rc=frontier_locations_all_rc,
+                frontier_locations_valid_rc=frontier_locations_valid_rc,
+                valid_indices_in_all=valid_indices_in_all,
+                distances_valid=distances_valid,
+                distance_inverse_valid=distance_inverse_valid,
+                scenegraph_scores=scenegraph_scores,
+                distance_bias=distance_bias,
+                total_scores=total_scores,
+                selected_valid_idx=selected_valid_idx,
+                selected_all_idx=selected_all_idx,
+                selected_goal_rc=selected_goal_rc,
+                data_tag=getattr(self.args, "gnn_data_tag", "sgnav_teacher"),
+                save_maps=bool(getattr(self.args, "gnn_save_maps", False)),
+                save_scenegraph_edges=bool(getattr(self.args, "gnn_save_scenegraph_edges", False)),
+                compute_oracle_online=bool(getattr(self.args, "gnn_compute_oracle_online", False)),
+            )
+            self.gnn_raw_logger.save_step(sample)
+        except Exception as exc:
+            if bool(getattr(self.args, "debug_gnn", False)):
+                print("[GNN] raw logging failed:", exc)
+
+    def log_gnn_frontier_sample(self, frontier_clusters, teacher_scores=None, selected_idx=None):
+        if self.gnn_logger is None or not bool(getattr(self.args, "gnn_log", False)):
+            return
+        if self.gnn_graph_builder is None or len(frontier_clusters) == 0:
+            return
+
+        graph = self.gnn_graph_builder.build(
+            scenegraph=self.scenegraph,
+            frontier_clusters=frontier_clusters,
+            goal_text=self.obj_goal_sg,
+            agent_pose=self.full_pose,
+            full_map=self.full_map,
+            free_map=self.fbe_free_map,
+            room_map=self.room_map,
+            current_step=getattr(self, "total_steps", 0),
+        )
+        self.gnn_logger.save_step(
+            graph=graph,
+            frontier_clusters=frontier_clusters,
+            goal_text=self.obj_goal_sg,
+            metadata=self.get_gnn_episode_metadata(),
+            teacher_scores=teacher_scores,
+            selected_idx=selected_idx,
+        )
+
+    def fbe_gnn(self, traversible, start, frontier_map, fmm_dist_m):
+        if self.gnn_scorer is None:
+            return None
+
+        frontier_clusters = self.get_gnn_frontier_clusters(frontier_map, fmm_dist_m)
+        if len(frontier_clusters) == 0:
+            return None
+
+        scores = self.gnn_scorer.score(
+            scenegraph=self.scenegraph,
+            frontier_clusters=frontier_clusters,
+            goal_text=self.obj_goal_sg,
+            agent_pose=self.full_pose,
+            full_map=self.full_map,
+            free_map=self.fbe_free_map,
+            room_map=self.room_map,
+            traversible=traversible,
+            cur_start=start,
+            current_step=getattr(self, "total_steps", 0),
+        )
+
+        if bool(getattr(self.args, "gnn_add_distance_bias", False)):
+            dist_bias = np.asarray([c.distance_inverse for c in frontier_clusters], dtype=np.float32)
+            scores = scores + float(getattr(self.args, "gnn_distance_weight", 1.0)) * dist_bias
+
+        data_policy = getattr(self.args, "gnn_data_policy", "sgnav")
+        if data_policy == "random":
+            best_idx = int(np.random.randint(len(frontier_clusters)))
+        elif data_policy == "distance":
+            best_idx = int(np.argmax([c.distance_inverse for c in frontier_clusters]))
+        else:
+            best_idx = int(np.argmax(scores))
+
+        if bool(getattr(self.args, "debug_gnn", False)):
+            print("[GNN] goal:", self.obj_goal_sg)
+            print("[GNN] num_frontier_clusters:", len(frontier_clusters))
+            print("[GNN] scores:", np.asarray(scores, dtype=np.float32).tolist())
+            print("[GNN] selected:", best_idx, frontier_clusters[best_idx].center_rc.tolist())
+
+        teacher_scores = None
+        if bool(getattr(self.args, "gnn_log", False)):
+            try:
+                cluster_centers_shifted = np.stack(
+                    [cluster.center_rc for cluster in frontier_clusters],
+                    axis=0,
+                ) + 1
+                teacher_scores = self.scenegraph.score(cluster_centers_shifted, len(frontier_clusters))
+                teacher_scores = teacher_scores + 2.0 * np.asarray(
+                    [cluster.distance_inverse for cluster in frontier_clusters],
+                    dtype=np.float32,
+                )
+            except Exception as exc:
+                if bool(getattr(self.args, "debug_gnn", False)):
+                    print("[GNN] teacher score logging failed:", exc)
+
+        self.log_gnn_frontier_sample(
+            frontier_clusters=frontier_clusters,
+            teacher_scores=teacher_scores,
+            selected_idx=best_idx,
+        )
+        return frontier_clusters[best_idx].center_rc.astype(np.int64)
     
     def fbe(self, traversible, start):
         fbe_map = torch.zeros_like(self.full_map[0,0])
@@ -843,6 +1066,18 @@ class SG_Nav_Agent():
         state = [start[0] + 1, start[1] + 1]
         planner.set_goal(state)
         fmm_dist = planner.fmm_dist[::-1]
+        fmm_dist_m = fmm_dist[1:-1, 1:-1] / 20.0
+
+        if bool(getattr(self.args, "use_gnn_nav", False)):
+            gnn_goal = self.fbe_gnn(
+                traversible=traversible,
+                start=start,
+                frontier_map=frontier_map,
+                fmm_dist_m=fmm_dist_m,
+            )
+            if gnn_goal is not None:
+                return gnn_goal
+
         frontier_locations += 1
         frontier_locations = frontier_locations.cpu().numpy()
         distances = fmm_dist[frontier_locations[:,0],frontier_locations[:,1]] / 20
@@ -858,11 +1093,58 @@ class SG_Nav_Agent():
             return None
         num_16_frontiers = len(idx_16[0])  # 175
 
-        scores = self.scenegraph.score(frontier_locations_16, num_16_frontiers)
-                
-        scores += 2 * distances_16_inverse
-        idx_16_max = idx_16[0][np.argmax(scores)]
+        scenegraph_scores = self.scenegraph.score(frontier_locations_16, num_16_frontiers)
+        distance_bias = 2 * distances_16_inverse
+        scores = scenegraph_scores + distance_bias
+        selected_valid_idx = int(np.argmax(scores))
+        idx_16_max = idx_16[0][selected_valid_idx]
         goal = frontier_locations[idx_16_max] - 1
+        if bool(getattr(self.args, "collect_gnn_data", False)):
+            self.log_gnn_raw_sample(
+                frontier_map=frontier_map,
+                fmm_dist=fmm_dist_m,
+                frontier_locations_all_rc=frontier_locations - 1,
+                frontier_locations_valid_rc=frontier_locations_16 - 1,
+                valid_indices_in_all=idx_16[0],
+                distances_valid=distances_16,
+                distance_inverse_valid=distances_16_inverse,
+                scenegraph_scores=scenegraph_scores,
+                distance_bias=distance_bias,
+                total_scores=scores,
+                selected_valid_idx=selected_valid_idx,
+                selected_all_idx=idx_16_max,
+                selected_goal_rc=goal,
+            )
+        if bool(getattr(self.args, "gnn_log", False)) and self.gnn_graph_builder is not None:
+            try:
+                frontier_clusters = self.get_gnn_frontier_clusters(frontier_map, fmm_dist_m)
+                if len(frontier_clusters) > 0:
+                    cluster_centers_shifted = np.stack(
+                        [cluster.center_rc for cluster in frontier_clusters],
+                        axis=0,
+                    ) + 1
+                    teacher_scores = self.scenegraph.score(cluster_centers_shifted, len(frontier_clusters))
+                    teacher_scores = teacher_scores + 2.0 * np.asarray(
+                        [cluster.distance_inverse for cluster in frontier_clusters],
+                        dtype=np.float32,
+                    )
+                    selected_idx = int(
+                        np.argmin(
+                            np.linalg.norm(
+                                np.stack([cluster.center_rc for cluster in frontier_clusters], axis=0)
+                                - goal.reshape(1, 2),
+                                axis=1,
+                            )
+                        )
+                    )
+                    self.log_gnn_frontier_sample(
+                        frontier_clusters=frontier_clusters,
+                        teacher_scores=teacher_scores,
+                        selected_idx=selected_idx,
+                    )
+            except Exception as exc:
+                if bool(getattr(self.args, "debug_gnn", False)):
+                    print("[GNN] replay logging failed:", exc)
         self.scores = scores
         return goal
         
@@ -1246,6 +1528,12 @@ def main():
         "--num_episodes", default=None, type=int
     )
     parser.add_argument(
+        "--episodes_per_scene", default=-1, type=int
+    )
+    parser.add_argument(
+        "--shuffle_scenes", action="store_true"
+    )
+    parser.add_argument(
         "--config",
         default="configs/challenge_objectnav2021.local.rgbd.yaml",
         type=str,
@@ -1280,13 +1568,104 @@ def main():
     parser.add_argument(
         "--found_goal_stop_distance_m", default=0.35, type=float
     )
+    parser.add_argument(
+        "--use_gnn_nav", action="store_true"
+    )
+    parser.add_argument(
+        "--collect_gnn_data", action="store_true"
+    )
+    parser.add_argument(
+        "--gnn_raw_log_dir", default="data/gnn_raw/mp3d/train", type=str
+    )
+    parser.add_argument(
+        "--gnn_collect_every_k_fbe", default=1, type=int
+    )
+    parser.add_argument(
+        "--gnn_save_maps", action="store_true"
+    )
+    parser.add_argument(
+        "--gnn_save_scenegraph_edges", action="store_true"
+    )
+    parser.add_argument(
+        "--gnn_compute_oracle_online", action="store_true"
+    )
+    parser.add_argument(
+        "--gnn_data_tag", default="sgnav_teacher", type=str
+    )
+    parser.add_argument(
+        "--gnn_ckpt", default=None, type=str
+    )
+    parser.add_argument(
+        "--gnn_log", action="store_true"
+    )
+    parser.add_argument(
+        "--gnn_log_dir", default="data/gnn_replay/mp3d/train", type=str
+    )
+    parser.add_argument(
+        "--gnn_max_frontiers", default=32, type=int
+    )
+    parser.add_argument(
+        "--gnn_text_dim", default=384, type=int
+    )
+    parser.add_argument(
+        "--gnn_add_distance_bias", action="store_true"
+    )
+    parser.add_argument(
+        "--gnn_distance_weight", default=1.0, type=float
+    )
+    parser.add_argument(
+        "--gnn_data_policy", default="sgnav", choices=["sgnav", "distance", "random", "gnn"], type=str
+    )
+    parser.add_argument(
+        "--debug_gnn", action="store_true"
+    )
     args = parser.parse_args()
     os.environ["CHALLENGE_CONFIG_FILE"] = args.config
     config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
     config = habitat.get_config(config_paths)
     agent = SG_Nav_Agent(task_config=config, args=args)
 
-    challenge = habitat.Challenge(eval_remote=False, split_l=args.split_l, split_r=args.split_r)
+    challenge_kwargs = {
+        "eval_remote": False,
+        "split_l": args.split_l,
+        "split_r": args.split_r,
+    }
+    if args.episodes_per_scene > 0:
+        challenge_kwargs["max_scene_repeat_episodes"] = args.episodes_per_scene
+    if args.shuffle_scenes:
+        challenge_kwargs["iterator_shuffle"] = True
+
+    try:
+        challenge = habitat.Challenge(**challenge_kwargs)
+    except TypeError as exc:
+        if "max_scene_repeat_episodes" not in str(exc) and "iterator_shuffle" not in str(exc):
+            raise
+        challenge = habitat.Challenge(
+            eval_remote=False,
+            split_l=args.split_l,
+            split_r=args.split_r,
+        )
+        env = getattr(challenge, "_env", None)
+        config_env = getattr(env, "_config", None)
+        if env is not None and config_env is not None:
+            try:
+                config_env.defrost()
+                if args.episodes_per_scene > 0:
+                    config_env.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_EPISODES = int(
+                        args.episodes_per_scene
+                    )
+                    config_env.ENVIRONMENT.ITERATOR_OPTIONS.GROUP_BY_SCENE = True
+                if args.shuffle_scenes:
+                    config_env.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = True
+                config_env.freeze()
+                env._setup_episode_iterator()
+                print(
+                    "[GNN] configured episode iterator after Challenge init: "
+                    f"episodes_per_scene={args.episodes_per_scene}, "
+                    f"shuffle_scenes={bool(args.shuffle_scenes)}"
+                )
+            except Exception as iterator_exc:
+                print("[GNN] failed to configure episode iterator:", iterator_exc)
 
     challenge.submit(agent, num_episodes=args.num_episodes)
 

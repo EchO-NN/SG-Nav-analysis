@@ -1,0 +1,10 @@
+module,SG-Nav_ms,GNN_with_original_graph_ms,Full_sparse_ms,notes
+Detection/segmentation,--,--,--,placeholder
+Scene graph update,--,--,--,placeholder
+LLM/VLM graph reasoning,--,--,--,placeholder
+Sparse graph build,--,--,--,placeholder
+GNN inference,--,--,--,placeholder
+Local planning,--,--,--,placeholder
+LLM calls/episode,--,--,--,placeholder
+VLM calls/episode,--,--,--,placeholder
+

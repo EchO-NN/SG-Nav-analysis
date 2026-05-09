@@ -30,7 +30,13 @@ class Benchmark:
     r"""Benchmark for evaluating agents in environments."""
 
     def __init__(
-        self, config_paths: Optional[str] = None, eval_remote: bool = False, split_l: int = -1, split_r: int = -1
+        self,
+        config_paths: Optional[str] = None,
+        eval_remote: bool = False,
+        split_l: int = -1,
+        split_r: int = -1,
+        max_scene_repeat_episodes: Optional[int] = None,
+        iterator_shuffle: Optional[bool] = None,
     ) -> None:
         r"""..
 
@@ -42,6 +48,14 @@ class Benchmark:
         config_env.DATASET.SPLIT_L = split_l
         config_env.DATASET.SPLIT_R = split_r
         config_env.DATASET.freeze()
+        if max_scene_repeat_episodes is not None or iterator_shuffle is not None:
+            config_env.ENVIRONMENT.ITERATOR_OPTIONS.defrost()
+            if max_scene_repeat_episodes is not None:
+                config_env.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_EPISODES = int(max_scene_repeat_episodes)
+                config_env.ENVIRONMENT.ITERATOR_OPTIONS.GROUP_BY_SCENE = True
+            if iterator_shuffle is not None:
+                config_env.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = bool(iterator_shuffle)
+            config_env.ENVIRONMENT.ITERATOR_OPTIONS.freeze()
         self._eval_remote = eval_remote
 
         if self._eval_remote is True:

@@ -1,0 +1,40 @@
+graph:
+  max_objects: 100
+  max_frontiers: 32
+  object_knn_k: 6
+  frontier_knn_k: 8
+  object_radius_m: 2.5
+  frontier_radius_m: 4.0
+  min_frontier_path_dist: 1.6
+  min_frontier_cluster_size: 3
+
+text:
+  embedding_dim: 384
+  cache_path: data/gnn/text_embeddings.pt
+  backend: auto
+  fallback_random: true
+
+model:
+  hidden_dim: 256
+  num_layers: 3
+  dropout: 0.1
+
+train:
+  lr: 0.0001
+  weight_decay: 0.00001
+  epochs: 20
+  grad_clip: 5.0
+  lambda_distill: 0.2
+  lambda_cred: 1.0
+  distill_temperature: 2.0
+
+inference:
+  add_distance_bias: true
+  distance_weight: 1.0
+  candidate_accept_threshold: 0.5
+  fallback:
+    max_prob_threshold: 0.45
+    margin_threshold: 0.10
+    entropy_threshold: 1.50
+    min_object_nodes: 1
+    stuck_steps_threshold: 8

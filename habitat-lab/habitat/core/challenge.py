@@ -11,9 +11,23 @@ from habitat.core.logging import logger
 
 
 class Challenge(Benchmark):
-    def __init__(self, eval_remote=False, split_l=-1, split_r=-1):
+    def __init__(
+        self,
+        eval_remote=False,
+        split_l=-1,
+        split_r=-1,
+        max_scene_repeat_episodes=None,
+        iterator_shuffle=None,
+    ):
         config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
-        super().__init__(config_paths, eval_remote=eval_remote, split_l=split_l, split_r=split_r)
+        super().__init__(
+            config_paths,
+            eval_remote=eval_remote,
+            split_l=split_l,
+            split_r=split_r,
+            max_scene_repeat_episodes=max_scene_repeat_episodes,
+            iterator_shuffle=iterator_shuffle,
+        )
 
     def submit(self, agent, num_episodes=None):
         metrics = super().evaluate(agent, num_episodes=num_episodes)

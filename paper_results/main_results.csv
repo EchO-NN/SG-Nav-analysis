@@ -1,0 +1,12 @@
+method,benchmark,SR,SPL,SoftSPL,avg_steps,path_length,notes
+SG-Nav,MP3D,--,--,--,--,--,placeholder
+Distance FBE,MP3D,--,--,--,--,--,placeholder
+GNN teacher-only,MP3D,--,--,--,--,--,placeholder
+GNN hindsight,MP3D,--,--,--,--,--,placeholder
+GNN hindsight + relabel,MP3D,--,--,--,--,--,placeholder
+SparseGNN-Nav full,MP3D,--,--,--,--,--,placeholder
+SG-Nav,HM3D,--,--,--,--,--,placeholder
+SparseGNN-Nav full,HM3D,--,--,--,--,--,placeholder
+SG-Nav,RoboTHOR,--,--,--,--,--,placeholder
+SparseGNN-Nav full,RoboTHOR,--,--,--,--,--,placeholder
+
