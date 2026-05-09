@@ -13,6 +13,20 @@ def mean(rows, key):
     return sum(float(row.get(key, 0.0)) for row in rows) / max(1, len(rows))
 
 
+def latest_run_rows(rows):
+    if not rows:
+        return rows, False
+
+    start = 0
+    prev_idx = rows[0].get("episode_idx")
+    for idx, row in enumerate(rows[1:], start=1):
+        cur_idx = row.get("episode_idx")
+        if isinstance(prev_idx, int) and isinstance(cur_idx, int) and cur_idx <= prev_idx:
+            start = idx
+        prev_idx = cur_idx
+    return rows[start:], start > 0
+
+
 def print_group(rows, key):
     groups = defaultdict(list)
     for row in rows:
@@ -33,7 +47,13 @@ def main():
         print(f"episode log not found: {sys.argv[1]}")
         raise SystemExit(1)
 
-    rows = load_rows(sys.argv[1])
+    all_rows = load_rows(sys.argv[1])
+    rows, trimmed = latest_run_rows(all_rows)
+    if trimmed:
+        print(
+            f"warning: detected appended logs from multiple runs; "
+            f"analyzing latest run only ({len(rows)}/{len(all_rows)} rows)"
+        )
     if not rows:
         print("no rows")
         return

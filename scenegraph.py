@@ -246,11 +246,11 @@ class SceneGraph():
         self.small_objects = ['bathtub', 'chest_of_drawers', 'cushion', 'plant', 'seating', 'shower', 'toilet', 'tv_monitor']
         self.found_goal_times_threshold = 1
         self.N_max = 10
+        self.edge_proposal_batch_size = int(os.environ.get("SGNAV_EDGE_PROPOSAL_BATCH_SIZE", "12"))
         self.node_space = 'bathtub. bed. cabinet. chair. drawers. clothes. counter. cushion. fireplace. gym. picture. plant. seating. shower. sink. sofa. stool. table. toilet. towel. tv. treadmill. fitness equipment.'
         self.prompt_edge_proposal = '''You are an indoor spatial relationship classifier.
 For each object pair, output one short spatial relation.
-Return a JSON array with exactly one object per input pair.
-Each object must have exactly this key: "relationship".
+Return a JSON array of strings with exactly one string per input pair.
 Do not output markdown or explanation.
 Allowed examples: next to, near, above, on top of, opposite to, below, inside, behind, in front of.
 
@@ -773,28 +773,8 @@ Final probability:'''
         new_edges = list(new_edges)
         # get all relation proposals
         if len(new_edges) > 0:
-            pairs = [
-                {"object1": edge.node1.caption, "object2": edge.node2.caption}
-                for edge in new_edges
-            ]
-            prompt = self.prompt_edge_proposal + json.dumps(pairs, ensure_ascii=False)
-            self.debug_stats.inc("edge_proposal_total")
-            raw = self.get_llm_response(
-                prompt=prompt,
-                request_type="edge_proposal",
-                max_tokens=max(64, 8 * len(new_edges)),
-            )
-            relations = parse_relation_lines(raw, expected_n=len(new_edges))
-            if relations is None:
-                self.debug_stats.inc("edge_proposal_parse_fail")
-                self.debug_stats.inc("edge_relation_mismatch")
-                self.debug_stats.log_response(
-                    request_type="edge_proposal_parse_fail",
-                    prompt=prompt,
-                    response=raw,
-                    meta={"expected_n": len(new_edges)},
-                )
-            else:
+            relations = self.propose_edge_relations(new_edges)
+            if relations is not None:
                 for i, relation in enumerate(relations):
                     new_edges[i].set_relation(relation)
             # discriminate all relation proposals
@@ -811,6 +791,40 @@ Final probability:'''
                     new_edge.delete()
                 else:
                     self.debug_stats.inc("edges_kept")
+
+    def propose_edge_relations(self, new_edges):
+        relations = []
+        batch_size = max(1, self.edge_proposal_batch_size)
+        for start in range(0, len(new_edges), batch_size):
+            batch = new_edges[start:start + batch_size]
+            pairs = [
+                {"object1": edge.node1.caption, "object2": edge.node2.caption}
+                for edge in batch
+            ]
+            prompt = self.prompt_edge_proposal + json.dumps(pairs, ensure_ascii=False)
+            self.debug_stats.inc("edge_proposal_total")
+            raw = self.get_llm_response(
+                prompt=prompt,
+                request_type="edge_proposal",
+                max_tokens=max(96, 24 * len(batch)),
+            )
+            batch_relations = parse_relation_lines(raw, expected_n=len(batch))
+            if batch_relations is None:
+                self.debug_stats.inc("edge_proposal_parse_fail")
+                self.debug_stats.inc("edge_relation_mismatch")
+                self.debug_stats.log_response(
+                    request_type="edge_proposal_parse_fail",
+                    prompt=prompt,
+                    response=raw,
+                    meta={"expected_n": len(batch), "batch_start": start},
+                )
+                relations.extend([None] * len(batch))
+            else:
+                relations.extend(batch_relations)
+        if len(relations) != len(new_edges):
+            self.debug_stats.inc("edge_relation_mismatch")
+            return None
+        return relations
 
     def update_group(self):
         for room_node in self.room_nodes:
