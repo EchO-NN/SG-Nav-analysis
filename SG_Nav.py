@@ -76,6 +76,23 @@ class SG_Nav_Agent():
         self.loop_time = 0
         self.last_segment_num = 0
         self.goal_merge_threshold = 0.8
+        self.reperception_max_steps = int(getattr(self.args, "reperception_max_steps", 10))
+        self.reperception_threshold = float(getattr(self.args, "reperception_threshold", 0.8))
+        self.reperception_min_observations = max(
+            1, int(getattr(self.args, "reperception_min_observations", 3))
+        )
+        self.reperception_min_dist_m = float(getattr(self.args, "reperception_min_dist_m", 0.25))
+        self.reperception_same_goal_radius_m = float(
+            getattr(self.args, "reperception_same_goal_radius_m", self.goal_merge_threshold)
+        )
+        self.rejected_goal_radius_m = float(
+            getattr(self.args, "rejected_goal_radius_m", self.goal_merge_threshold)
+        )
+        self.rejected_goal_ttl = int(getattr(self.args, "rejected_goal_ttl", 80))
+        self.found_goal_stop_distance_m = max(
+            0.05, float(getattr(self.args, "found_goal_stop_distance_m", 0.35))
+        )
+        self.reset_reperception_state()
         self.rooms = rooms
         self.rooms_captions = rooms_captions
         self.split = (self.args.split_l >= 0)
@@ -229,8 +246,241 @@ class SG_Nav_Agent():
         self.text_edge = ''
         self.stop_reason = ''
         self.episode_logged = False
+        self.reset_reperception_state()
 
         self.scenegraph.reset()
+
+    def reset_reperception_state(self):
+        self.reperception_active = False
+        self.reperception_goal_gps = None
+        self.reperception_goal_map_xy = None
+        self.reperception_source = ""
+        self.reperception_score_sum = 0.0
+        self.reperception_steps = 0
+        self.reperception_observation_count = 0
+        self.reperception_last_step = -1
+        self.reperception_history = []
+        self.rejected_goal_candidates = []
+
+    def goal_gps_to_map_xy(self, goal_gps):
+        """Return map pixel [x, y] in the same convention as SceneGraph node.center."""
+        goal_gps = np.asarray(goal_gps, dtype=np.float32)
+        x = int(self.map_size_cm / 10 + goal_gps[0] * 100 / self.resolution)
+        y = int(self.map_size_cm / 10 + goal_gps[1] * 100 / self.resolution)
+        x = min(max(x, 0), self.map_size - 1)
+        y = min(max(y, 0), self.map_size - 1)
+        return np.array([x, y], dtype=np.float32)
+
+    def confidence_to_float(self, confidence, default=0.5):
+        if confidence is None:
+            self.scenegraph.debug_stats.inc("reperception_confidence_fallback")
+            return float(default)
+        try:
+            if torch.is_tensor(confidence):
+                return float(confidence.detach().cpu().item())
+            value = np.asarray(confidence).reshape(-1)[0]
+            return float(value)
+        except Exception:
+            self.scenegraph.debug_stats.inc("reperception_confidence_fallback")
+            return float(default)
+
+    def mark_goal_candidate_map(self, goal_gps):
+        goal_xy = self.goal_gps_to_map_xy(goal_gps)
+        x = int(goal_xy[0])
+        y = int(goal_xy[1])
+        thres = int(self.goal_merge_threshold * 100 / self.map_resolution)
+        x0 = max(x - thres, 0)
+        x1 = min(x + thres + 1, self.map_size)
+        y0 = max(y - thres, 0)
+        y1 = min(y + thres + 1, self.map_size)
+        local = self.goal_gps_map[y0:y1, x0:x1]
+        if local.size == 0:
+            return
+        if local.max() > 0:
+            max_idx = np.unravel_index(np.argmax(local), local.shape)
+            local[max_idx] += 1
+        else:
+            self.goal_gps_map[y, x] = 1
+
+    def compute_reperception_score_k(self, goal_gps, confidence):
+        goal_xy = self.goal_gps_to_map_xy(goal_gps)
+        subgraphs = self.scenegraph.get_scored_subgraphs_for_goal(self.obj_goal_sg)
+        score_graph = 0.0
+        contributions = []
+        for subgraph in subgraphs:
+            center_xy = np.asarray(subgraph["center_xy"], dtype=np.float32)
+            dist_pix = float(np.linalg.norm(center_xy - goal_xy))
+            dist_m = max(dist_pix * self.map_resolution / 100.0, self.reperception_min_dist_m)
+            p_sub = float(np.clip(subgraph["score"], 0.0, 1.0))
+            term = p_sub / dist_m
+            score_graph += term
+            center_node = subgraph.get("center_node")
+            contributions.append({
+                "center": center_xy.tolist(),
+                "center_caption": getattr(center_node, "caption", ""),
+                "room": subgraph.get("room", ""),
+                "p_sub": p_sub,
+                "dist_m": dist_m,
+                "term": term,
+            })
+        score_k = float(confidence) * float(score_graph)
+        return score_k, contributions
+
+    def is_rejected_goal_candidate(self, goal_gps):
+        goal_gps = np.asarray(goal_gps, dtype=np.float32)
+        kept = []
+        rejected = False
+        for item in self.rejected_goal_candidates:
+            if self.total_steps - item["step"] <= self.rejected_goal_ttl:
+                kept.append(item)
+                if np.linalg.norm(goal_gps - item["gps"]) <= self.rejected_goal_radius_m:
+                    rejected = True
+        self.rejected_goal_candidates = kept
+        return rejected
+
+    def start_or_update_reperception_candidate(self, goal_gps, confidence, source):
+        goal_gps = np.asarray(goal_gps, dtype=np.float32)
+        confidence = float(confidence)
+        if self.is_rejected_goal_candidate(goal_gps):
+            self.scenegraph.debug_stats.inc("reperception_rejected_blacklist")
+            return "rejected_blacklist"
+
+        same_candidate_same_step = (
+            self.reperception_active
+            and self.reperception_last_step == self.total_steps
+            and self.reperception_goal_gps is not None
+            and np.linalg.norm(goal_gps - self.reperception_goal_gps) <= self.reperception_same_goal_radius_m
+        )
+        if (
+            not self.reperception_active
+            or self.reperception_goal_gps is None
+            or np.linalg.norm(goal_gps - self.reperception_goal_gps) > self.reperception_same_goal_radius_m
+        ):
+            self.reperception_active = True
+            self.reperception_goal_gps = goal_gps.copy()
+            self.reperception_goal_map_xy = self.goal_gps_to_map_xy(goal_gps)
+            self.reperception_source = source
+            self.reperception_score_sum = 0.0
+            self.reperception_steps = 0
+            self.reperception_observation_count = 0
+            self.reperception_history = []
+            self.scenegraph.debug_stats.inc("reperception_candidates_started")
+
+        self.reperception_goal_gps = goal_gps.copy()
+        self.reperception_goal_map_xy = self.goal_gps_to_map_xy(goal_gps)
+        self.reperception_source = source
+        if same_candidate_same_step:
+            self.found_goal = False
+            self.found_possible_goal = True
+            self.possible_goal_temp_gps = self.reperception_goal_gps.copy()
+            self.scenegraph.debug_stats.inc("reperception_duplicate_observation")
+            return "pending"
+
+        score_k, contributions = self.compute_reperception_score_k(goal_gps, confidence)
+        self.reperception_score_sum += score_k
+        self.reperception_steps += 1
+        self.reperception_observation_count += 1
+        self.reperception_last_step = self.total_steps
+        top_contributions = sorted(contributions, key=lambda x: x["term"], reverse=True)[:3]
+        history_item = {
+            "step": int(self.total_steps),
+            "source": source,
+            "confidence": confidence,
+            "score_k": float(score_k),
+            "score_sum": float(self.reperception_score_sum),
+            "observation_count": int(self.reperception_observation_count),
+            "num_subgraphs": len(contributions),
+            "top_contributions": top_contributions,
+            "status": "pending",
+        }
+        self.reperception_history.append(history_item)
+        self.scenegraph.debug_stats.inc("reperception_observations")
+
+        score_ready = self.reperception_score_sum >= self.reperception_threshold
+        enough_observations = self.reperception_observation_count >= self.reperception_min_observations
+        if score_ready and enough_observations and self.reperception_steps < self.reperception_max_steps:
+            history_item["status"] = "confirmed"
+            self.confirm_reperception_goal()
+            return "confirmed"
+
+        if self.reperception_steps >= self.reperception_max_steps:
+            history_item["status"] = "rejected"
+            self.reject_reperception_goal(reason="credibility_below_threshold")
+            return "rejected"
+
+        if score_ready and not enough_observations:
+            history_item["status"] = "pending_min_observations"
+            self.scenegraph.debug_stats.inc("reperception_wait_min_observations")
+
+        self.found_goal = False
+        self.found_possible_goal = True
+        self.possible_goal_temp_gps = self.reperception_goal_gps.copy()
+        self.found_goal_times = self.reperception_score_sum
+        return "pending"
+
+    def tick_reperception_without_observation(self, source):
+        if (
+            not self.reperception_active
+            or self.reperception_goal_gps is None
+            or self.reperception_last_step == self.total_steps
+        ):
+            return
+
+        self.reperception_steps += 1
+        self.reperception_last_step = self.total_steps
+        history_item = {
+            "step": int(self.total_steps),
+            "source": source,
+            "confidence": 0.0,
+            "score_k": 0.0,
+            "score_sum": float(self.reperception_score_sum),
+            "observation_count": int(self.reperception_observation_count),
+            "num_subgraphs": 0,
+            "top_contributions": [],
+            "status": "pending",
+        }
+        self.reperception_history.append(history_item)
+        self.scenegraph.debug_stats.inc("reperception_missed_observations")
+
+        if self.reperception_steps >= self.reperception_max_steps:
+            history_item["status"] = "rejected"
+            self.reject_reperception_goal(reason="candidate_not_reconfirmed")
+            return
+
+        self.found_goal = False
+        self.found_possible_goal = True
+        self.possible_goal_temp_gps = self.reperception_goal_gps.copy()
+        self.found_goal_times = self.reperception_score_sum
+
+    def confirm_reperception_goal(self):
+        if self.reperception_goal_gps is None:
+            return
+        self.goal_gps = self.reperception_goal_gps.copy()
+        self.found_goal = True
+        self.found_possible_goal = False
+        self.found_goal_times = self.reperception_score_sum
+        self.reperception_active = False
+        self.scenegraph.debug_stats.inc("reperception_confirmed")
+
+    def reject_reperception_goal(self, reason):
+        if self.reperception_goal_gps is not None:
+            self.rejected_goal_candidates.append({
+                "gps": self.reperception_goal_gps.copy(),
+                "step": int(self.total_steps),
+                "reason": reason,
+            })
+        self.found_goal = False
+        self.found_possible_goal = False
+        self.found_goal_times = 0
+        self.goal_gps_map.fill(0)
+        self.reperception_active = False
+        self.reperception_goal_gps = None
+        self.reperception_goal_map_xy = None
+        self.reperception_source = ""
+        self.reperception_score_sum = 0.0
+        self.reperception_steps = 0
+        self.reperception_observation_count = 0
+        self.scenegraph.debug_stats.inc("reperception_rejected")
         
     def detect_objects(self, observations):
         self.current_obj_predictions = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], object_captions) # GLIP object detection, time cosuming
@@ -240,18 +490,25 @@ class SG_Nav_Agent():
         
         shortest_distance = 120
         shortest_distance_angle = 0
-        goal_prediction = copy.deepcopy(self.current_obj_predictions)
         obj_labels = self.current_obj_predictions.get_field("labels")
-        goal_bbox = []
+        obj_scores = self.current_obj_predictions.get_field("scores")
+        goal_detections = []
         for j, label in enumerate(obj_labels):
+            score = self.confidence_to_float(obj_scores[j])
             if self.obj_goal in label:
-                goal_bbox.append(self.current_obj_predictions.bbox[j])
+                goal_detections.append({
+                    "bbox": self.current_obj_predictions.bbox[j],
+                    "score": score,
+                })
             elif self.obj_goal == 'gym_equipment' and (label in ['treadmill', 'exercise machine']):
-                goal_bbox.append(self.current_obj_predictions.bbox[j])
+                goal_detections.append({
+                    "bbox": self.current_obj_predictions.bbox[j],
+                    "score": score,
+                })
         
         for j, label in enumerate(obj_labels):
             if label in categories_21_origin:
-                confidence = self.current_obj_predictions.get_field("scores")[j]
+                confidence = self.confidence_to_float(self.current_obj_predictions.get_field("scores")[j])
                 bbox = self.current_obj_predictions.bbox[j].to(torch.int64)
                 center_point = (bbox[:2] + bbox[2:]) // 2
                 temp_direction = (center_point[0] - 320) * 79 / 640
@@ -265,20 +522,29 @@ class SG_Nav_Agent():
         
         if self.scenegraph.obj_goal in self.scenegraph.small_objects:
             self.segment_num = len(self.scenegraph.segment2d_results)
-            goal_mask = []
+            goal_masks = []
             if self.segment_num > self.last_segment_num:
                 self.last_segment_num = self.segment_num
                 segment2d_result = self.scenegraph.segment2d_results[-1]
-                indices = []
                 for index, element in enumerate(segment2d_result['caption']):
                     if self.obj_goal_sg in element.split(' '):
                         for node in self.scenegraph.nodes:
                             if node.is_goal_node and node.object['image_idx'][-1] == len(self.scenegraph.segment2d_results) - 1 and node.object['mask_idx'][-1] == index:
-                                indices.append(index)
-                goal_mask = [segment2d_result['mask'][index] for index in indices]
-            if len(goal_mask) > 0:
+                                confidence = None
+                                if "confidence" in segment2d_result:
+                                    confidence = segment2d_result["confidence"][index]
+                                elif "conf" in node.object and len(node.object["conf"]) > 0:
+                                    confidence = node.object["conf"][-1]
+                                goal_masks.append({
+                                    "mask": segment2d_result['mask'][index],
+                                    "confidence": self.confidence_to_float(confidence),
+                                })
+                                break
+            if len(goal_masks) > 0:
                 possible_goal_detected_before = copy.deepcopy(self.found_possible_goal)
-                for mask in goal_mask:
+                for item in goal_masks:
+                    mask = item["mask"]
+                    confidence = item["confidence"]
                     center_point = torch.tensor(np.argwhere(mask).mean(axis=0).astype(int))
                     center_point = torch.tensor([center_point[1], center_point[0]])
                     temp_direction = (center_point[0] - 320) * 79 / 640
@@ -290,15 +556,20 @@ class SG_Nav_Agent():
                         k += 0.5
                         temp_distance = max(self.depth[center_point[1]+int(pos_neg*k),center_point[0],0],
                         self.depth[center_point[1],center_point[0]+int(pos_neg*k),0])
-                        
+
+                    goal_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
+                    if self.is_rejected_goal_candidate(goal_gps):
+                        continue
                     if temp_distance >= self.distance_threshold:
                         self.found_possible_goal = True
                     else:
-                        if self.found_goal:
-                            if temp_distance < self.distance_threshold:
-                                self.found_goal_times = self.found_goal_times + 1
-                        self.found_goal = True
-                        self.found_possible_goal = False
+                        status = self.start_or_update_reperception_candidate(
+                            goal_gps=goal_gps,
+                            confidence=confidence,
+                            source="groundedsam_mask",
+                        )
+                        if status == "confirmed":
+                            break
                     
                     ## select the closest goal
                     direction = temp_direction
@@ -307,26 +578,29 @@ class SG_Nav_Agent():
                         shortest_distance = distance
                         shortest_distance_angle = direction
                 
-                if self.found_goal:
-                    self.goal_gps = self.get_goal_gps(observations, shortest_distance_angle, shortest_distance)
-                elif not possible_goal_detected_before:
+                if (
+                    not self.found_goal
+                    and not possible_goal_detected_before
+                    and self.found_possible_goal
+                    and not self.reperception_active
+                ):
                     # if detected a long goal before, then don't change it until see a goal within 5 meters
                     self.possible_goal_temp_gps = self.get_goal_gps(observations, shortest_distance_angle, shortest_distance)
             else:
                 if self.found_goal:
                     self.found_goal = False
                     self.found_goal_times = 0
+            self.tick_reperception_without_observation("groundedsam_mask_missing")
             return
         else:
-            if len(goal_bbox) > 0:
+            if len(goal_detections) > 0:
                 possible_goal_detected_before = copy.deepcopy(self.found_possible_goal)
-                goal_prediction.bbox = torch.stack(goal_bbox)
-                for box in goal_prediction.bbox:
-                    box = box.to(torch.int64)
+                for detection in goal_detections:
+                    box = detection["bbox"].to(torch.int64)
+                    confidence = detection["score"]
                     center_point = (box[:2] + box[2:]) // 2
                     temp_direction = (center_point[0] - 320) * 79 / 640
                     temp_distance = self.depth[center_point[1],center_point[0],0]
-                    goal_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
                     k = 0
                     pos_neg = 1
                     while temp_distance >= 100 and 0<center_point[1]+int(pos_neg*k)<479 and 0<center_point[0]+int(pos_neg*k)<639:
@@ -334,18 +608,21 @@ class SG_Nav_Agent():
                         k += 0.5
                         temp_distance = max(self.depth[center_point[1]+int(pos_neg*k),center_point[0],0],
                         self.depth[center_point[1],center_point[0]+int(pos_neg*k),0])
-                        
+
+                    goal_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
+                    if self.is_rejected_goal_candidate(goal_gps):
+                        continue
                     if temp_distance >= self.distance_threshold:
                         self.found_possible_goal = True
                     else:
-                        thres = int(self.goal_merge_threshold * 100 / self.map_resolution)
-                        if 0 <= int(self.map_size_cm/10+goal_gps[0]*100/self.resolution) < self.map_size and 0 <= int(self.map_size_cm/10+goal_gps[1]*100/self.resolution) < self.map_size:
-                            goal_gps_map_local = self.goal_gps_map[max(int(self.map_size_cm/10+goal_gps[1]*100/self.resolution) - thres, 0):min(int(self.map_size_cm/10+goal_gps[1]*100/self.resolution) + thres, self.map_size - 1), max(int(self.map_size_cm/10+goal_gps[0]*100/self.resolution) - thres, 0):min(int(self.map_size_cm/10+goal_gps[0]*100/self.resolution) + thres, self.map_size - 1)]
-                            if goal_gps_map_local.max() > 0:
-                                goal_gps_map_local[np.where(goal_gps_map_local == goal_gps_map_local.max())[0][0], np.where(goal_gps_map_local == goal_gps_map_local.max())[1][0]] = goal_gps_map_local[np.where(goal_gps_map_local == goal_gps_map_local.max())[0][0], np.where(goal_gps_map_local == goal_gps_map_local.max())[1][0]] + 1
-                            else:
-                                self.goal_gps_map[min(max(int(self.map_size_cm/10+goal_gps[1]*100/self.resolution), 0), self.map_size), min(max(int(self.map_size_cm/10+goal_gps[0]*100/self.resolution), 0), self.map_size)] = 1
-                        self.found_possible_goal = False
+                        self.mark_goal_candidate_map(goal_gps)
+                        status = self.start_or_update_reperception_candidate(
+                            goal_gps=goal_gps,
+                            confidence=confidence,
+                            source="glip_bbox",
+                        )
+                        if status == "confirmed":
+                            break
                     
                     direction = temp_direction
                     distance = temp_distance
@@ -353,15 +630,14 @@ class SG_Nav_Agent():
                         shortest_distance = distance
                         shortest_distance_angle = direction
                 
-                self.found_goal_times = self.goal_gps_map.max()
-                if self.found_goal_times >= self.scenegraph.cfg.obj_min_detections:
-                    self.found_goal = True
-
-                if self.found_goal:
-                    self.goal_gps = np.flip(np.array(np.where(self.goal_gps_map == self.goal_gps_map.max()))[:, 0])
-                    self.goal_gps = (self.goal_gps - self.map_size_cm / 10) / 100 * self.resolution
-                elif not possible_goal_detected_before:
+                if (
+                    not self.found_goal
+                    and not possible_goal_detected_before
+                    and self.found_possible_goal
+                    and not self.reperception_active
+                ):
                     self.possible_goal_temp_gps = self.get_goal_gps(observations, shortest_distance_angle, shortest_distance)
+            self.tick_reperception_without_observation("glip_bbox_missing")
             return
                         
     def act(self, observations):
@@ -794,6 +1070,11 @@ class SG_Nav_Agent():
         decrease_stop_cond =0
         if self.dilation_deg >= 6:
             decrease_stop_cond = 0.2 #decrease to 0.2 (7 grids until closest goal)
+        if goal_found:
+            decrease_stop_cond = max(
+                decrease_stop_cond,
+                self.planner.stop_cond - self.found_goal_stop_distance_m,
+            )
         stg_y, stg_x, replan, stop = self.planner.get_short_term_goal(state, found_goal = goal_found, decrease_stop_cond=decrease_stop_cond)
         stg_x, stg_y = stg_x - 1, stg_y - 1
         
@@ -851,9 +1132,18 @@ class SG_Nav_Agent():
             "room_nodes_with_groups": sum(
                 1 for room_node in self.scenegraph.room_nodes if len(room_node.group_nodes) > 0
             ),
-            "goal_detection_count": int(self.found_goal_times),
+            "goal_detection_count": float(self.found_goal_times),
             "found_goal": bool(self.found_goal),
             "found_possible_goal": bool(self.found_possible_goal),
+            "reperception_active": bool(self.reperception_active),
+            "reperception_steps": int(self.reperception_steps),
+            "reperception_observation_count": int(self.reperception_observation_count),
+            "reperception_min_observations": int(self.reperception_min_observations),
+            "reperception_threshold": float(self.reperception_threshold),
+            "reperception_score_sum": float(self.reperception_score_sum),
+            "found_goal_stop_distance_m": float(self.found_goal_stop_distance_m),
+            "reperception_rejected_count": len(self.rejected_goal_candidates),
+            "reperception_history": self.reperception_history[-10:],
             "llm_parse_failures": self.scenegraph.debug_stats.summary(),
         }
         self.episode_logger.log(row)
@@ -965,6 +1255,30 @@ def main():
     )
     parser.add_argument(
         "--debug_sgnav_dir", default="data/debug_sgnav", type=str
+    )
+    parser.add_argument(
+        "--reperception_min_observations", default=3, type=int
+    )
+    parser.add_argument(
+        "--reperception_threshold", default=0.8, type=float
+    )
+    parser.add_argument(
+        "--reperception_max_steps", default=10, type=int
+    )
+    parser.add_argument(
+        "--reperception_min_dist_m", default=0.25, type=float
+    )
+    parser.add_argument(
+        "--reperception_same_goal_radius_m", default=0.8, type=float
+    )
+    parser.add_argument(
+        "--rejected_goal_radius_m", default=0.8, type=float
+    )
+    parser.add_argument(
+        "--rejected_goal_ttl", default=80, type=int
+    )
+    parser.add_argument(
+        "--found_goal_stop_distance_m", default=0.35, type=float
     )
     args = parser.parse_args()
     os.environ["CHALLENGE_CONFIG_FILE"] = args.config

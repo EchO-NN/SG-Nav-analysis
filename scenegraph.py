@@ -235,6 +235,9 @@ class SceneGraph():
         self.vlm_name = os.environ.get('VLLM_VLM_MODEL', os.environ.get('VLLM_MODEL', self.llm_name))
         self.seg_xyxy = None
         self.seg_caption = None
+        self._subgraph_score_cache_key = None
+        self._subgraph_score_cache = []
+        self._wall_orientation_cache = {}
         
         self.groundingdino_config_file = 'GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'
         self.groundingdino_checkpoint = 'data/models/groundingdino_swint_ogc.pth'
@@ -297,6 +300,9 @@ Final probability:'''
         self.edge_list = []
         self.reason_visualization = ''
         self.last_debug_print_step = None
+        self._subgraph_score_cache_key = None
+        self._subgraph_score_cache = []
+        self._wall_orientation_cache = {}
 
     def set_cfg(self):
         cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': 'cuda', 'use_iou': True, 'spatial_sim_type': 'overlap', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.025, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 10, 'obj_min_points': 0, 'obj_min_detections': 3, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
@@ -755,6 +761,7 @@ Final probability:'''
             node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
             new_edges = new_edges | node_new_edges
         new_edges = list(new_edges)
+        all_new_edges = list(new_edges)
         for new_edge in new_edges:
             image = self.get_joint_image(new_edge.node1, new_edge.node2)
             if image is not None:
@@ -771,26 +778,27 @@ Final probability:'''
             node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
             new_edges = new_edges | node_new_edges
         new_edges = list(new_edges)
-        # get all relation proposals
+        # get relation proposals for long-range edges that do not share an RGB-D frame
         if len(new_edges) > 0:
             relations = self.propose_edge_relations(new_edges)
             if relations is not None:
                 for i, relation in enumerate(relations):
                     new_edges[i].set_relation(relation)
-            # discriminate all relation proposals
-            self.free_map = self.fbe_free_map.cpu().numpy()[0,0,::-1].copy() > 0.5
-            none_count = sum(edge.relation is None for edge in new_edges)
-            if none_count > 0:
-                self.debug_stats.inc("edge_none_relation", none_count)
-            for i, new_edge in enumerate(new_edges):
-                if new_edge.relation is None:
-                    self.debug_stats.inc("edges_deleted")
-                    new_edge.delete()
-                elif not self.discriminate_relation(new_edge):
-                    self.debug_stats.inc("edges_deleted")
-                    new_edge.delete()
-                else:
-                    self.debug_stats.inc("edges_kept")
+
+        # Validate both short-range VLM relations and long-range LLM proposals.
+        self.free_map = self.fbe_free_map.cpu().numpy()[0,0,::-1].copy() > 0.5
+        none_count = sum(edge.relation is None for edge in all_new_edges)
+        if none_count > 0:
+            self.debug_stats.inc("edge_none_relation", none_count)
+        for new_edge in all_new_edges:
+            if new_edge.relation is None:
+                self.debug_stats.inc("edges_deleted")
+                new_edge.delete()
+            elif not self.discriminate_relation(new_edge):
+                self.debug_stats.inc("edges_deleted")
+                new_edge.delete()
+            else:
+                self.debug_stats.inc("edges_kept")
 
     def propose_edge_relations(self, new_edges):
         relations = []
@@ -889,6 +897,46 @@ Final probability:'''
         self.mid_term_goal = sorted_group_nodes[-1].center
         self.debug_stats.inc("insert_goal_success")
         return self.mid_term_goal
+
+    def get_scored_subgraphs_for_goal(self, goal, force_refresh=False):
+        """Return group-based subgraph scores for frontier scoring and re-perception.
+
+        The paper defines one subgraph around each object node. This implementation
+        reuses the existing GroupNode abstraction because SG-Nav already scores
+        those groups with graph_corr during frontier selection.
+        """
+        cache_key = (goal, getattr(self, "navigate_steps", -1), len(self.nodes), len(self.get_edges()))
+        if (
+            not force_refresh
+            and self._subgraph_score_cache_key == cache_key
+            and self._subgraph_score_cache is not None
+        ):
+            return self._subgraph_score_cache
+
+        self.update_group()
+        items = []
+        for room_node in self.room_nodes:
+            for group_node in room_node.group_nodes:
+                if len(group_node.nodes) == 0:
+                    continue
+                group_node.get_graph()
+                if group_node.center is None or group_node.center_node is None:
+                    continue
+                p_sub = float(self.graph_corr(goal, group_node))
+                p_sub = float(np.clip(p_sub, 0.0, 1.0))
+                items.append({
+                    "score": p_sub,
+                    "center_xy": np.array(group_node.center, dtype=np.float32),
+                    "center_node": group_node.center_node,
+                    "group_node": group_node,
+                    "room": getattr(room_node, "caption", ""),
+                    "caption": group_node.caption,
+                })
+
+        self._subgraph_score_cache_key = cache_key
+        self._subgraph_score_cache = items
+        self.debug_stats.inc("subgraph_score_refresh")
+        return items
 
     def fallback_room_by_cooccurrence(self):
         if not hasattr(self.agent, "prob_array_room"):
@@ -1065,43 +1113,179 @@ Final probability:'''
         self.debug_stats.inc("discriminate_total")
         image = self.get_joint_image(edge.node1, edge.node2)
         if image is not None:
-            response = self.get_vlm_response(
-                self.prompt_discriminate_relation.format(
-                    edge.node1.caption,
-                    edge.node2.caption,
-                    edge.relation,
-                ),
-                image,
-                request_type="discriminate_relation",
-                max_tokens=8,
-            )
-            accepted = parse_yes_no(response, default=False)
-            self.debug_stats.inc("discriminate_yes" if accepted else "discriminate_no")
-            return accepted
-        else:
-            if edge.node1.room_node != edge.node2.room_node:
+            return self.validate_short_edge(edge, image)
+        return self.validate_long_edge(edge)
+
+    def validate_short_edge(self, edge, image):
+        response = self.get_vlm_response(
+            self.prompt_discriminate_relation.format(
+                edge.node1.caption,
+                edge.node2.caption,
+                edge.relation,
+            ),
+            image,
+            request_type="discriminate_short_relation",
+            max_tokens=8,
+        )
+        accepted = parse_yes_no(response, default=False)
+        self.debug_stats.inc("edge_short_keep" if accepted else "edge_short_drop")
+        self.debug_stats.inc("discriminate_yes" if accepted else "discriminate_no")
+        return accepted
+
+    def validate_long_edge(self, edge):
+        if not self.nodes_in_same_room(edge.node1, edge.node2):
+            self.debug_stats.inc("edge_long_drop_room")
+            self.debug_stats.inc("discriminate_no")
+            return False
+
+        p1 = np.array(edge.node1.center, dtype=np.float32)
+        p2 = np.array(edge.node2.center, dtype=np.float32)
+
+        max_long_edge_dist_m = float(os.environ.get("SGNAV_MAX_LONG_EDGE_DIST_M", "0"))
+        if max_long_edge_dist_m > 0:
+            distance_m = float(np.linalg.norm(p2 - p1) * self.map_resolution / 100.0)
+            if distance_m > max_long_edge_dist_m:
+                self.debug_stats.inc("edge_long_drop_distance")
                 self.debug_stats.inc("discriminate_no")
                 return False
-            x1, y1 = edge.node1.center
-            x2, y2 = edge.node2.center
-            distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            if distance > self.map_size // 40:
-                self.debug_stats.inc("discriminate_no")
+
+        if not self.line_unobstructed(p1, p2):
+            self.debug_stats.inc("edge_long_drop_obstructed")
+            self.debug_stats.inc("discriminate_no")
+            return False
+
+        if not self.line_parallel_to_room_wall(p1, p2, edge.node1.room_node):
+            self.debug_stats.inc("edge_long_drop_not_parallel")
+            self.debug_stats.inc("discriminate_no")
+            return False
+
+        self.debug_stats.inc("edge_long_keep")
+        self.debug_stats.inc("discriminate_yes")
+        return True
+
+    def nodes_in_same_room(self, node1, node2):
+        return (
+            getattr(node1, "room_node", None) is not None
+            and getattr(node2, "room_node", None) is not None
+            and node1.room_node is node2.room_node
+        )
+
+    def sample_line_pixels(self, p1, p2):
+        x1, y1 = p1
+        x2, y2 = p2
+        steps = int(max(abs(x2 - x1), abs(y2 - y1))) + 1
+        steps = max(steps, 2)
+        xs = np.linspace(x1, x2, steps).round().astype(np.int32)
+        ys = np.linspace(y1, y2, steps).round().astype(np.int32)
+        xs = np.clip(xs, 0, self.map_size - 1)
+        ys = np.clip(ys, 0, self.map_size - 1)
+        return xs, ys
+
+    def line_unobstructed(self, p1, p2, min_free_ratio=0.90, ignore_endpoint_px=3):
+        if not hasattr(self, "free_map") or self.free_map is None:
+            if not hasattr(self, "fbe_free_map"):
                 return False
-            alpha = math.atan2(y2 - y1, x2 - x1)  
-            sin_2alpha = 2 * math.sin(alpha) * math.cos(alpha)
-            if not -0.05 < sin_2alpha < 0.05:
-                self.debug_stats.inc("discriminate_no")
-                return False
-            n = 3
-            for i in range(1, n):
-                x = int(x1 + (x2 - x1) * i / n)
-                y = int(y1 + (y2 - y1) * i / n)
-                if not self.free_map[y, x]:
-                    self.debug_stats.inc("discriminate_no")
-                    return False
-            self.debug_stats.inc("discriminate_yes")
+            fbe_free_map = self.fbe_free_map
+            if torch.is_tensor(fbe_free_map):
+                free_array = fbe_free_map.detach().cpu().numpy()
+            else:
+                free_array = np.asarray(fbe_free_map)
+            if free_array.ndim == 4:
+                free_array = free_array[0, 0]
+            self.free_map = free_array[::-1].copy() > 0.5
+
+        xs, ys = self.sample_line_pixels(p1, p2)
+        if len(xs) > 2 * ignore_endpoint_px:
+            xs = xs[ignore_endpoint_px:-ignore_endpoint_px]
+            ys = ys[ignore_endpoint_px:-ignore_endpoint_px]
+        if len(xs) == 0:
             return True
+        free_values = self.free_map[ys, xs]
+        return float(np.mean(free_values)) >= min_free_ratio
+
+    def angle_diff_mod_pi(self, a, b):
+        return abs((a - b + np.pi / 2) % np.pi - np.pi / 2)
+
+    def estimate_wall_orientations(self, room_node=None, min_line_length_px=20):
+        cache_key = (id(room_node), getattr(self, "navigate_steps", -1), min_line_length_px)
+        if cache_key in self._wall_orientation_cache:
+            return self._wall_orientation_cache[cache_key]
+        if not hasattr(self, "full_map"):
+            return []
+
+        full_map = self.full_map
+        if torch.is_tensor(full_map):
+            map_array = full_map.detach().cpu().numpy()
+        else:
+            map_array = np.asarray(full_map)
+        if map_array.ndim == 4:
+            map_array = map_array[0, 0]
+        obstacle = map_array[::-1] > 0.5
+        img = obstacle.astype(np.uint8) * 255
+
+        crop = img
+        if room_node is not None and len(getattr(room_node, "nodes", [])) > 0:
+            pts = np.array([
+                node.center
+                for node in room_node.nodes
+                if getattr(node, "center", None) is not None
+            ])
+            if len(pts) > 0:
+                x0 = max(int(np.min(pts[:, 0])) - 80, 0)
+                y0 = max(int(np.min(pts[:, 1])) - 80, 0)
+                x1 = min(int(np.max(pts[:, 0])) + 80, self.map_size - 1)
+                y1 = min(int(np.max(pts[:, 1])) + 80, self.map_size - 1)
+                crop = img[y0:y1 + 1, x0:x1 + 1]
+
+        if crop.size == 0:
+            self._wall_orientation_cache[cache_key] = []
+            return []
+
+        edges = cv2.Canny(crop, 50, 150)
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=20,
+            minLineLength=min_line_length_px,
+            maxLineGap=5,
+        )
+        if lines is None:
+            self._wall_orientation_cache[cache_key] = []
+            return []
+
+        angles = []
+        for line in lines[:, 0, :]:
+            x1, y1, x2, y2 = line
+            if x1 == x2 and y1 == y2:
+                continue
+            angles.append(math.atan2(y2 - y1, x2 - x1) % np.pi)
+
+        if len(angles) == 0:
+            self._wall_orientation_cache[cache_key] = []
+            return []
+
+        hist, bins = np.histogram(angles, bins=18, range=(0, np.pi))
+        top_bins = np.argsort(hist)[-3:]
+        dominant = []
+        for idx in top_bins:
+            if hist[idx] > 0:
+                dominant.append(float((bins[idx] + bins[idx + 1]) / 2.0))
+        self._wall_orientation_cache[cache_key] = dominant
+        return dominant
+
+    def line_parallel_to_room_wall(self, p1, p2, room_node=None, tol_deg=10.0):
+        edge_angle = math.atan2(float(p2[1] - p1[1]), float(p2[0] - p1[0])) % np.pi
+        wall_angles = self.estimate_wall_orientations(room_node)
+        if len(wall_angles) == 0:
+            self.debug_stats.inc("edge_long_wall_orientation_fallback")
+            if os.environ.get("SGNAV_LONG_EDGE_AXIS_FALLBACK", "0") in ["1", "true", "True"]:
+                wall_angles = [0.0, np.pi / 2]
+            else:
+                return False
+
+        tol = math.radians(tol_deg)
+        return min(self.angle_diff_mod_pi(edge_angle, wall_angle) for wall_angle in wall_angles) <= tol
         
     def perception(self):
         if not self.agent.found_goal:
