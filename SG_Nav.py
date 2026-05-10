@@ -159,10 +159,12 @@ class SG_Nav_Agent():
         self.gnn_scorer = None
         self.gnn_logger = None
         self.gnn_raw_logger = None
+        self.gnn_episode_summary_logger = None
         if (
             bool(getattr(self.args, "use_gnn_nav", False))
             or bool(getattr(self.args, "gnn_log", False))
             or bool(getattr(self.args, "collect_gnn_data", False))
+            or bool(getattr(self.args, "collect_episode_summary", False))
         ):
             self.init_gnn_nav_modules()
 
@@ -198,12 +200,19 @@ class SG_Nav_Agent():
         model.add_rule(Rule('Choose(+F) = 1 .'))
 
     def init_gnn_nav_modules(self):
+        from gnn_data.episode_logger import EpisodeSummaryLogger
         from gnn_data.raw_logger import GNNRawLogger
 
         self.gnn_raw_logger = GNNRawLogger(
             log_dir=getattr(self.args, "gnn_raw_log_dir", "data/gnn_raw/mp3d/train"),
             enabled=bool(getattr(self.args, "collect_gnn_data", False)),
             collect_every_k_fbe=getattr(self.args, "gnn_collect_every_k_fbe", 1),
+            data_tag=getattr(self.args, "gnn_data_tag", "sgnav_teacher"),
+        )
+        self.gnn_episode_summary_logger = EpisodeSummaryLogger(
+            log_dir=getattr(self.args, "gnn_episode_summary_dir", "data/gnn_episode_summary/mp3d/train"),
+            enabled=bool(getattr(self.args, "collect_episode_summary", False))
+            or bool(getattr(self.args, "collect_gnn_data", False)),
             data_tag=getattr(self.args, "gnn_data_tag", "sgnav_teacher"),
         )
 
@@ -1391,7 +1400,9 @@ class SG_Nav_Agent():
     def log_episode_result(self, metrics):
         if getattr(self, "episode_logged", False):
             return
-        if not getattr(self.episode_logger, "enabled", False):
+        debug_logger_enabled = bool(getattr(self.episode_logger, "enabled", False))
+        summary_logger_enabled = bool(getattr(getattr(self, "gnn_episode_summary_logger", None), "enabled", False))
+        if not debug_logger_enabled and not summary_logger_enabled:
             return
         self.episode_logged = True
         episode = self.simulator._env.current_episode
@@ -1428,7 +1439,14 @@ class SG_Nav_Agent():
             "reperception_history": self.reperception_history[-10:],
             "llm_parse_failures": self.scenegraph.debug_stats.summary(),
         }
-        self.episode_logger.log(row)
+        if debug_logger_enabled:
+            self.episode_logger.log(row)
+        if summary_logger_enabled:
+            try:
+                self.gnn_episode_summary_logger.save_episode(self, metrics)
+            except Exception as exc:
+                if bool(getattr(self.args, "debug_gnn", False)):
+                    print("[GNN] episode summary logging failed:", exc)
 
     def update_visualization_text(self, number_action):
         nodes = self.scenegraph.get_nodes()
@@ -1575,7 +1593,13 @@ def main():
         "--collect_gnn_data", action="store_true"
     )
     parser.add_argument(
+        "--collect_episode_summary", action="store_true"
+    )
+    parser.add_argument(
         "--gnn_raw_log_dir", default="data/gnn_raw/mp3d/train", type=str
+    )
+    parser.add_argument(
+        "--gnn_episode_summary_dir", default="data/gnn_episode_summary/mp3d/train", type=str
     )
     parser.add_argument(
         "--gnn_collect_every_k_fbe", default=1, type=int

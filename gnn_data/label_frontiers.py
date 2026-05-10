@@ -1,7 +1,9 @@
 import argparse
 import copy
 import glob
+import json
 import os
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +16,23 @@ from gnn_data.hindsight_labels import (
 )
 from gnn_data.raw_schema import LABEL_VERSION, make_soft_frontier_label, softmax_scores
 from gnn_nav.dataset import safe_torch_load
+
+
+FINAL_LABEL_MODES = {
+    "hindsight_goal",
+    "hindsight_goal_strict",
+    "hindsight_all_objects",
+    "hindsight_all_objects_strict",
+    "final_map_hindsight",
+    "final_map_hindsight_strict",
+    "hybrid_hindsight_first_strict",
+}
+
+
+class SkipSample(Exception):
+    def __init__(self, reason: str, message: str = ""):
+        super().__init__(message or reason)
+        self.reason = reason
 
 
 def _as_numpy(value):
@@ -43,6 +62,13 @@ def _frontier_count(sample):
     return 0
 
 
+def _validate_frontiers(sample, min_label_frontiers: int):
+    n_frontiers = _frontier_count(sample)
+    if n_frontiers < int(min_label_frontiers):
+        raise SkipSample("skipped_invalid_frontiers", f"need >= {min_label_frontiers} frontiers, got {n_frontiers}")
+    return n_frontiers
+
+
 def _distance_cost(sample):
     frontier = sample.get("frontier", {})
     distances = frontier.get("distances_valid", frontier.get("mean_path_dist", None))
@@ -54,7 +80,7 @@ def _distance_cost(sample):
     return np.zeros((_frontier_count(sample),), dtype=np.float32)
 
 
-def _oracle_saved(sample):
+def _oracle_saved(sample, allow_unvalidated_geodesic: bool = False):
     oracle = sample.get("oracle", {})
     if not isinstance(oracle, dict):
         return None
@@ -66,8 +92,14 @@ def _oracle_saved(sample):
     y = _as_numpy(y).astype(np.float32).reshape(-1)
     if len(costs) != len(y) or len(costs) == 0:
         return None
+    label_type = str(oracle.get("label_type", "oracle_online_saved"))
+    if label_type == "online_geodesic_unvalidated" and not allow_unvalidated_geodesic:
+        raise SkipSample(
+            "skipped_unvalidated_geodesic",
+            "online_geodesic_unvalidated requires --allow_unvalidated_geodesic",
+        )
     best_idx = int(oracle.get("frontier_best_idx", int(np.argmin(np.where(np.isfinite(costs), costs, np.inf)))))
-    return costs, y, best_idx, str(oracle.get("label_type", "oracle_online_saved"))
+    return costs, y, best_idx, label_type
 
 
 def _approx_map_cost(sample, lambda_goal: float):
@@ -91,7 +123,48 @@ def _approx_map_cost(sample, lambda_goal: float):
     return costs + float(lambda_goal) * goal_dist.astype(np.float32)
 
 
-def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float, lambda_goal: float):
+def _canonical_mode(label_mode: str) -> str:
+    aliases = {
+        "teacher_debug": "teacher",
+        "oracle_geodesic_diagnostic": "simulator_geodesic",
+        "oracle_approx_debug": "oracle_approx_map",
+        "final_map_hindsight_strict": "final_map_hindsight",
+    }
+    return aliases.get(label_mode, label_mode)
+
+
+def _set_label_source(sample: dict, source: str):
+    sample.setdefault("labels", {})
+    sample["labels"]["label_source"] = source
+
+
+def label_sample(
+    sample,
+    label_mode: str,
+    tau: float,
+    teacher_temperature: float,
+    lambda_goal: float,
+    strict_labels: bool = False,
+    forbid_teacher_fallback: bool = False,
+    forbid_approx_fallback: bool = False,
+    require_hindsight_or_oracle: bool = False,
+    min_label_frontiers: int = 1,
+    allow_unvalidated_geodesic: bool = False,
+):
+    original_label_mode = label_mode
+    label_mode = _canonical_mode(label_mode)
+    if original_label_mode.endswith("_strict") or label_mode.endswith("_strict") or strict_labels:
+        strict_labels = True
+        final_mode = original_label_mode in FINAL_LABEL_MODES or label_mode in FINAL_LABEL_MODES
+        forbid_teacher_fallback = True if final_mode else forbid_teacher_fallback
+        forbid_approx_fallback = True if final_mode else forbid_approx_fallback
+        require_hindsight_or_oracle = True if final_mode else require_hindsight_or_oracle
+    if label_mode == "hindsight_goal_strict":
+        label_mode = "hindsight_goal"
+    if label_mode == "hybrid_hindsight_first_strict":
+        label_mode = "hybrid_hindsight_first"
+
+    _validate_frontiers(sample, min_label_frontiers)
     n_frontiers = _frontier_count(sample)
     teacher_scores = _teacher_scores(sample)
     teacher_y = None
@@ -100,7 +173,7 @@ def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float
         teacher_y = softmax_scores(teacher_scores, teacher_temperature)
         teacher_best = int(np.argmax(teacher_scores)) if len(teacher_scores) else -1
 
-    oracle = _oracle_saved(sample)
+    oracle = None
     extra_label_fields = {}
     if label_mode == "teacher":
         if teacher_scores is None or len(teacher_scores) != n_frontiers:
@@ -110,6 +183,7 @@ def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float
         best_idx = teacher_best
         label_type = "teacher_debug"
     elif label_mode in ["oracle_online_saved", "simulator_geodesic"]:
+        oracle = _oracle_saved(sample, allow_unvalidated_geodesic=allow_unvalidated_geodesic)
         if oracle is None:
             raise ValueError(f"{label_mode} mode requires saved sample['oracle'] frontier labels")
         costs, y_soft, best_idx, label_type = oracle
@@ -119,7 +193,14 @@ def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float
         goal_rc = goal_rc_from_sample(sample)
         if goal_rc is None:
             raise ValueError(f"{label_mode} mode requires a goal rc field in sample['goal'], metadata, or agent")
-        out = label_with_goal_rc(sample, goal_rc, tau=tau, lambda_goal=lambda_goal, label_type=label_mode)
+        out = label_with_goal_rc(
+            sample,
+            goal_rc,
+            tau=tau,
+            lambda_goal=lambda_goal,
+            label_type=label_mode,
+            label_source="sample_goal_rc",
+        )
         sample.clear()
         sample.update(out)
         costs = _as_numpy(sample["labels"]["frontier_cost"]).astype(np.float32)
@@ -128,6 +209,7 @@ def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float
         label_type = str(sample["labels"]["label_type"])
         extra_label_fields["hindsight_goal_rc"] = sample["labels"].get("hindsight_goal_rc")
     elif label_mode == "hybrid":
+        oracle = _oracle_saved(sample, allow_unvalidated_geodesic=allow_unvalidated_geodesic)
         if oracle is not None:
             costs, y_soft, best_idx, label_type = oracle
             label_type = f"{label_type}+teacher" if teacher_y is not None else label_type
@@ -138,6 +220,7 @@ def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float
                 tau=tau,
                 lambda_goal=lambda_goal,
                 label_type="hindsight_goal+teacher" if teacher_y is not None else "hindsight_goal",
+                label_source="sample_goal_rc",
             )
             sample.clear()
             sample.update(out)
@@ -147,15 +230,44 @@ def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float
             label_type = str(sample["labels"]["label_type"])
             extra_label_fields["hindsight_goal_rc"] = sample["labels"].get("hindsight_goal_rc")
         elif teacher_scores is not None and len(teacher_scores) == n_frontiers:
+            if strict_labels or forbid_teacher_fallback or require_hindsight_or_oracle:
+                raise SkipSample("skipped_no_hindsight_or_oracle")
             costs = -teacher_scores
             y_soft = teacher_y
             best_idx = teacher_best
             label_type = "teacher_debug_fallback"
         else:
+            if strict_labels or forbid_approx_fallback or require_hindsight_or_oracle:
+                raise SkipSample("skipped_no_hindsight_or_oracle")
             costs = _approx_map_cost(sample, lambda_goal)
             y_soft = make_soft_frontier_label(costs, tau=tau)
             best_idx = int(np.argmin(np.where(np.isfinite(costs), costs, np.inf))) if len(costs) else -1
             label_type = "oracle_approx_map_fallback"
+    elif label_mode == "hybrid_hindsight_first":
+        goal_rc = goal_rc_from_sample(sample)
+        if goal_rc is not None:
+            out = label_with_goal_rc(
+                sample,
+                goal_rc,
+                tau=tau,
+                lambda_goal=lambda_goal,
+                label_type="hindsight_goal",
+                label_source="sample_goal_rc",
+            )
+            sample.clear()
+            sample.update(out)
+            costs = _as_numpy(sample["labels"]["frontier_cost"]).astype(np.float32)
+            y_soft = _as_numpy(sample["labels"]["frontier_y_soft"]).astype(np.float32)
+            best_idx = int(sample["labels"]["frontier_best_idx"])
+            label_type = str(sample["labels"]["label_type"])
+            extra_label_fields["hindsight_goal_rc"] = sample["labels"].get("hindsight_goal_rc")
+            extra_label_fields["label_source"] = "sample_goal_rc"
+        else:
+            oracle = _oracle_saved(sample, allow_unvalidated_geodesic=allow_unvalidated_geodesic)
+            if oracle is None:
+                raise SkipSample("skipped_no_hindsight_or_oracle")
+            costs, y_soft, best_idx, label_type = oracle
+            extra_label_fields["label_source"] = "sample_oracle"
     elif label_mode == "oracle_approx_map":
         costs = _approx_map_cost(sample, lambda_goal)
         y_soft = make_soft_frontier_label(costs, tau=tau)
@@ -170,6 +282,7 @@ def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float
         "frontier_cost": torch.tensor(costs, dtype=torch.float32),
         "frontier_best_idx": int(best_idx),
         "label_type": label_type,
+        "label_source": extra_label_fields.pop("label_source", label_type),
     }
     sample["labels"].update({k: v for k, v in extra_label_fields.items() if v is not None})
     if teacher_y is not None:
@@ -183,13 +296,37 @@ def label_sample(sample, label_mode: str, tau: float, teacher_temperature: float
     return sample
 
 
-def label_samples(sample, label_mode: str, tau: float, teacher_temperature: float, lambda_goal: float, pseudo_goal_min_confidence: float):
-    if label_mode != "hindsight_all_objects":
-        return [label_sample(sample, label_mode, tau, teacher_temperature, lambda_goal)]
+def label_samples(
+    sample,
+    label_mode: str,
+    tau: float,
+    teacher_temperature: float,
+    lambda_goal: float,
+    pseudo_goal_min_confidence: float,
+    pseudo_goal_min_observed_count: int = 1,
+    pseudo_goal_min_lifetime_steps: int = 0,
+    pseudo_goal_max_per_category: int = 0,
+    pseudo_goal_exclude_unknown: bool = False,
+    pseudo_goal_exclude_rejected_candidates: bool = False,
+    pseudo_goal_balance_categories: bool = False,
+    **label_kwargs,
+):
+    strict_all_objects = label_mode == "hindsight_all_objects_strict"
+    if label_mode not in ["hindsight_all_objects", "hindsight_all_objects_strict"]:
+        return [label_sample(sample, label_mode, tau, teacher_temperature, lambda_goal, **label_kwargs)]
 
-    pseudo_goals = pseudo_goal_objects(sample, min_confidence=pseudo_goal_min_confidence)
+    pseudo_goals = pseudo_goal_objects(
+        sample,
+        min_confidence=pseudo_goal_min_confidence,
+        min_observed_count=pseudo_goal_min_observed_count,
+        min_lifetime_steps=pseudo_goal_min_lifetime_steps,
+        max_per_category=pseudo_goal_max_per_category,
+        exclude_unknown=pseudo_goal_exclude_unknown or strict_all_objects,
+        exclude_rejected_candidates=pseudo_goal_exclude_rejected_candidates or strict_all_objects,
+        balance_categories=pseudo_goal_balance_categories,
+    )
     if not pseudo_goals:
-        raise ValueError("hindsight_all_objects mode found no confident objects with center_rc")
+        raise SkipSample("skipped_no_valid_pseudo_goal")
     out = []
     for idx, pseudo in enumerate(pseudo_goals):
         relabeled = copy.deepcopy(sample)
@@ -206,12 +343,19 @@ def label_samples(sample, label_mode: str, tau: float, teacher_temperature: floa
             pseudo["goal_rc"],
             tau=tau,
             lambda_goal=lambda_goal,
-            label_type="hindsight_all_objects",
+            label_type="hindsight_all_objects_strict" if strict_all_objects else "hindsight_all_objects",
+            label_source="scenegraph_object_pseudo_goal",
         )
         relabeled["version"] = LABEL_VERSION
         relabeled["labels"]["pseudo_goal_text"] = pseudo["goal_text"]
         relabeled["labels"]["pseudo_goal_index"] = int(idx)
         relabeled["labels"]["pseudo_goal_confidence"] = float(pseudo["confidence"])
+        relabeled["labels"]["pseudo_goal_observed_count"] = int(pseudo["observed_count"])
+        relabeled["labels"]["pseudo_goal_first_seen_step"] = int(pseudo["first_seen_step"])
+        relabeled["labels"]["pseudo_goal_last_seen_step"] = int(pseudo["last_seen_step"])
+        relabeled["labels"]["pseudo_goal_source_node_id"] = (
+            -1 if pseudo.get("source_node_id") is None else int(pseudo.get("source_node_id"))
+        )
         out.append(relabeled)
     return out
 
@@ -226,19 +370,40 @@ def main():
         required=True,
         choices=[
             "teacher",
+            "teacher_debug",
             "oracle_online_saved",
             "simulator_geodesic",
+            "oracle_geodesic_diagnostic",
             "final_map_hindsight",
+            "final_map_hindsight_strict",
             "hindsight_goal",
+            "hindsight_goal_strict",
             "hindsight_all_objects",
+            "hindsight_all_objects_strict",
             "hybrid",
+            "hybrid_hindsight_first_strict",
             "oracle_approx_map",
+            "oracle_approx_debug",
         ],
     )
     parser.add_argument("--tau", type=float, default=2.0)
     parser.add_argument("--teacher_temperature", type=float, default=1.0)
     parser.add_argument("--lambda_goal", type=float, default=1.0)
     parser.add_argument("--pseudo_goal_min_confidence", type=float, default=0.5)
+    parser.add_argument("--pseudo_goal_min_observed_count", type=int, default=1)
+    parser.add_argument("--pseudo_goal_min_lifetime_steps", type=int, default=0)
+    parser.add_argument("--pseudo_goal_max_per_category", type=int, default=0)
+    parser.add_argument("--pseudo_goal_exclude_unknown", action="store_true")
+    parser.add_argument("--pseudo_goal_exclude_rejected_candidates", action="store_true")
+    parser.add_argument("--pseudo_goal_balance_categories", action="store_true")
+    parser.add_argument("--strict_labels", action="store_true")
+    parser.add_argument("--forbid_teacher_fallback", action="store_true")
+    parser.add_argument("--forbid_approx_fallback", action="store_true")
+    parser.add_argument("--require_hindsight_or_oracle", action="store_true")
+    parser.add_argument("--min_label_frontiers", type=int, default=1)
+    parser.add_argument("--skip_unlabeled", action="store_true")
+    parser.add_argument("--write_label_report", nargs="?", const="label_report.json", default=None)
+    parser.add_argument("--allow_unvalidated_geodesic", action="store_true")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--skip_errors", action="store_true")
     args = parser.parse_args()
@@ -250,6 +415,9 @@ def main():
 
     count = 0
     skipped = 0
+    label_type_counts = Counter()
+    skip_reason_counts = Counter()
+    output_dir = Path(args.output_dir)
     for path in paths:
         try:
             sample = safe_torch_load(path, map_location="cpu")
@@ -260,10 +428,29 @@ def main():
                 args.teacher_temperature,
                 args.lambda_goal,
                 args.pseudo_goal_min_confidence,
+                pseudo_goal_min_observed_count=args.pseudo_goal_min_observed_count,
+                pseudo_goal_min_lifetime_steps=args.pseudo_goal_min_lifetime_steps,
+                pseudo_goal_max_per_category=args.pseudo_goal_max_per_category,
+                pseudo_goal_exclude_unknown=args.pseudo_goal_exclude_unknown,
+                pseudo_goal_exclude_rejected_candidates=args.pseudo_goal_exclude_rejected_candidates,
+                pseudo_goal_balance_categories=args.pseudo_goal_balance_categories,
+                strict_labels=args.strict_labels,
+                forbid_teacher_fallback=args.forbid_teacher_fallback,
+                forbid_approx_fallback=args.forbid_approx_fallback,
+                require_hindsight_or_oracle=args.require_hindsight_or_oracle,
+                min_label_frontiers=args.min_label_frontiers,
+                allow_unvalidated_geodesic=args.allow_unvalidated_geodesic,
             )
+        except SkipSample as exc:
+            if args.skip_unlabeled or args.skip_errors or args.strict_labels:
+                skipped += 1
+                skip_reason_counts[exc.reason] += 1
+                continue
+            raise
         except Exception:
             if args.skip_errors:
                 skipped += 1
+                skip_reason_counts["skipped_error"] += 1
                 continue
             raise
         rel = os.path.relpath(path, args.input_dir)
@@ -282,10 +469,40 @@ def main():
             torch.save(labeled_sample, tmp_path)
             os.replace(tmp_path, out_path)
             count += 1
+            label_type = str(labeled_sample.get("labels", {}).get("label_type", "missing"))
+            label_type_counts[label_type] += 1
+
+    report = {
+        "input_dir": args.input_dir,
+        "output_dir": args.output_dir,
+        "label_mode": args.label_mode,
+        "num_input_files": len(paths),
+        "num_labeled_samples": count,
+        "num_skipped_samples": skipped,
+        "label_type_counts": dict(label_type_counts),
+        "skip_reason_counts": dict(skip_reason_counts),
+        "strict_labels": bool(args.strict_labels),
+        "forbid_teacher_fallback": bool(args.forbid_teacher_fallback),
+        "forbid_approx_fallback": bool(args.forbid_approx_fallback),
+        "require_hindsight_or_oracle": bool(args.require_hindsight_or_oracle),
+    }
+    if (args.strict_labels or args.forbid_teacher_fallback) and label_type_counts.get("teacher_debug_fallback", 0) > 0:
+        raise RuntimeError("strict labeling produced teacher_debug_fallback labels")
+    if (args.strict_labels or args.forbid_approx_fallback) and label_type_counts.get("oracle_approx_map_fallback", 0) > 0:
+        raise RuntimeError("strict labeling produced oracle_approx_map_fallback labels")
 
     print(f"labeled {count} samples -> {args.output_dir}")
+    print("label_type_counts:", dict(label_type_counts))
+    print("skip_reason_counts:", dict(skip_reason_counts))
     if skipped:
         print(f"skipped {skipped} samples")
+    if args.write_label_report:
+        report_path = Path(args.write_label_report)
+        if not report_path.is_absolute():
+            report_path = output_dir / report_path
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+        print(f"wrote label report: {report_path}")
 
 
 if __name__ == "__main__":

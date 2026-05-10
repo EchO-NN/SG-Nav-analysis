@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -35,10 +36,17 @@ def _metric_dict(records):
             "rank_loss": 0.0,
             "top1": 0.0,
             "top3": 0.0,
+            "pred_oracle_top1": 0.0,
+            "pred_oracle_top3": 0.0,
             "chosen_cost": 0.0,
             "best_cost": 0.0,
             "cost_ratio": 0.0,
-            "teacher_agreement": 0.0,
+            "pred_cost_ratio": 0.0,
+            "pred_teacher_agreement": 0.0,
+            "teacher_oracle_agreement": 0.0,
+            "teacher_cost_ratio": 0.0,
+            "distance_cost_ratio": 0.0,
+            "random_cost_ratio": 0.0,
             "num_frontiers_mean": 0.0,
             "num_objects_mean": 0.0,
             "count": 0,
@@ -52,12 +60,24 @@ def _metric_dict(records):
         "rank_loss": float(np.mean([r["rank_loss"] for r in records])),
         "top1": float(np.mean([r["top1"] for r in records])),
         "top3": float(np.mean([r["top3"] for r in records])),
+        "pred_oracle_top1": float(np.mean([r["pred_oracle_top1"] for r in records])),
+        "pred_oracle_top3": float(np.mean([r["pred_oracle_top3"] for r in records])),
         "chosen_cost": float(np.mean(chosen)),
         "best_cost": float(np.mean(best)),
         "cost_ratio": _safe_ratio(chosen, best),
-        "teacher_agreement": float(np.mean([r["teacher_agreement"] for r in records if r["teacher_agreement"] >= 0]))
-        if any(r["teacher_agreement"] >= 0 for r in records)
+        "pred_cost_ratio": _safe_ratio(chosen, best),
+        "pred_teacher_agreement": float(np.mean([r["pred_teacher_agreement"] for r in records if r["pred_teacher_agreement"] >= 0]))
+        if any(r["pred_teacher_agreement"] >= 0 for r in records)
         else 0.0,
+        "teacher_oracle_agreement": float(np.mean([r["teacher_oracle_agreement"] for r in records if r["teacher_oracle_agreement"] >= 0]))
+        if any(r["teacher_oracle_agreement"] >= 0 for r in records)
+        else 0.0,
+        "teacher_cost_ratio": _safe_ratio(
+            [r["teacher_chosen_cost"] for r in records if np.isfinite(r["teacher_chosen_cost"])],
+            [r["best_cost"] for r in records if np.isfinite(r["teacher_chosen_cost"])],
+        ),
+        "distance_cost_ratio": _safe_ratio([r["distance_chosen_cost"] for r in records], best),
+        "random_cost_ratio": _safe_ratio([r["random_chosen_cost"] for r in records], best),
         "num_frontiers_mean": float(np.mean([r["num_frontiers"] for r in records])),
         "num_objects_mean": float(np.mean([r["num_objects"] for r in records])),
         "count": len(records),
@@ -78,6 +98,15 @@ def _record_from_logits(sample, logits, loss, frontier_loss, teacher_loss, rank_
     chosen_cost = float(finite_costs[pred].detach().cpu().item())
     best_cost = float(finite_costs[best_idx].detach().cpu().item())
     teacher_best = int(labels.get("teacher_best_idx", -1))
+    teacher_chosen_cost = float("nan")
+    if 0 <= teacher_best < finite_costs.numel():
+        teacher_chosen_cost = float(finite_costs[teacher_best].detach().cpu().item())
+    distance_scores = sample.get("frontier", {}).get("distance_inverse")
+    if distance_scores is not None and len(distance_scores) == finite_costs.numel():
+        distance_idx = int(torch.argmax(torch.as_tensor(distance_scores)).item())
+    else:
+        distance_idx = 0
+    random_idx = 0
     return {
         "loss": float(loss.detach().cpu().item()),
         "frontier_loss": float(frontier_loss.detach().cpu().item()),
@@ -85,9 +114,15 @@ def _record_from_logits(sample, logits, loss, frontier_loss, teacher_loss, rank_
         "rank_loss": float(rank_loss.detach().cpu().item()),
         "top1": float(pred == best_idx),
         "top3": float(top3),
+        "pred_oracle_top1": float(pred == best_idx),
+        "pred_oracle_top3": float(top3),
         "chosen_cost": chosen_cost,
         "best_cost": best_cost,
-        "teacher_agreement": float(teacher_best == best_idx) if teacher_best >= 0 else -1.0,
+        "pred_teacher_agreement": float(pred == teacher_best) if teacher_best >= 0 else -1.0,
+        "teacher_oracle_agreement": float(teacher_best == best_idx) if teacher_best >= 0 else -1.0,
+        "teacher_chosen_cost": teacher_chosen_cost,
+        "distance_chosen_cost": float(finite_costs[distance_idx].detach().cpu().item()) if finite_costs.numel() else float("nan"),
+        "random_chosen_cost": float(finite_costs[random_idx].detach().cpu().item()) if finite_costs.numel() else float("nan"),
         "num_frontiers": int(logits.numel()),
         "num_objects": int(sample["graph"].node_features.get("object").shape[0]),
     }
@@ -171,8 +206,14 @@ def _format_metrics(prefix, metrics):
         "rank_loss",
         "top1",
         "top3",
-        "cost_ratio",
-        "teacher_agreement",
+        "pred_oracle_top1",
+        "pred_oracle_top3",
+        "pred_cost_ratio",
+        "pred_teacher_agreement",
+        "teacher_oracle_agreement",
+        "teacher_cost_ratio",
+        "distance_cost_ratio",
+        "random_cost_ratio",
         "num_frontiers_mean",
         "num_objects_mean",
         "count",
@@ -230,11 +271,11 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_metrics = train_one_epoch(model, train_loader, optimizer, device, args)
         msg = f"epoch={epoch:03d} " + _format_metrics("train", train_metrics)
-        monitor = train_metrics["cost_ratio"] if train_metrics["cost_ratio"] > 0 else train_metrics["loss"]
+        monitor = train_metrics["pred_cost_ratio"] if train_metrics["pred_cost_ratio"] > 0 else train_metrics["loss"]
         if val_loader is not None:
             val_metrics = evaluate(model, val_loader, device, args)
             msg += " " + _format_metrics("val", val_metrics)
-            monitor = val_metrics["cost_ratio"] if val_metrics["cost_ratio"] > 0 else val_metrics["loss"]
+            monitor = val_metrics["pred_cost_ratio"] if val_metrics["pred_cost_ratio"] > 0 else val_metrics["loss"]
             if not best_metrics or monitor <= best_score:
                 best_score = monitor
                 best_metrics = val_metrics
@@ -245,6 +286,15 @@ def main():
                 best_metrics = train_metrics
                 save_checkpoint(model, model_cfg, args, args.output_dir, best_metrics)
         print(msg)
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        with open(os.path.join(args.output_dir, "metrics.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {"epoch": epoch, "train": train_metrics, "val": val_metrics if val_loader is not None else None},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
     path = save_checkpoint(model, model_cfg, args, args.output_dir, best_metrics)
     print(f"saved checkpoint: {path}")
@@ -252,4 +302,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -74,6 +74,52 @@ python -m gnn_data.inspect_raw_sample \
 
 ### 3. 生成标签
 
+正式训练建议优先使用 episode summary + final-map hindsight 标注，不要把 teacher 分数当作主监督。
+新流程是先采集 raw step 和 episode summary：
+
+```bash
+./run_sg_nav.sh \
+  --config configs/challenge_objectnav2021.local.rgbd.gnn_unseen50_s0_e2.yaml \
+  --collect_gnn_data \
+  --collect_episode_summary \
+  --gnn_raw_log_dir data/gnn_raw/mp3d/train50 \
+  --gnn_episode_summary_dir data/gnn_episode_summary/mp3d/train50 \
+  --gnn_collect_every_k_fbe 1 \
+  --gnn_save_maps \
+  --gnn_data_tag train50_sgnav \
+  --num_episodes 100 \
+  --split_l 0 \
+  --split_r 50 \
+  --shuffle_scenes
+```
+
+然后用成功 episode 的 final map 和确认目标位置生成严格 hindsight 标签：
+
+```bash
+python -m gnn_data.hindsight_relabel \
+  --raw_step_dir data/gnn_raw/mp3d/train50 \
+  --episode_summary_dir data/gnn_episode_summary/mp3d/train50 \
+  --output_dir data/gnn_labeled_hindsight/mp3d/train50 \
+  --label_mode hindsight_goal_strict \
+  --strict_labels \
+  --skip_unlabeled \
+  --tau 2.0 \
+  --lambda_goal 1.0 \
+  --write_label_report
+```
+
+检查 hindsight 标签可视化：
+
+```bash
+python -m gnn_data.visualize_hindsight_sample \
+  --labeled_dir data/gnn_labeled_hindsight/mp3d/train50 \
+  --save_dir data/debug_hindsight_vis/train50 \
+  --num_samples 50
+```
+
+严格模式会跳过没有成功、没有确认目标位置、没有 final map、frontier 太少或距离全无效的样本。
+`label_report.json` 里必须确认 `teacher_debug_fallback` 和 `oracle_approx_map_fallback` 为 0。
+
 如果 raw 中已经保存在线 oracle：
 
 ```bash
@@ -120,13 +166,28 @@ python -m gnn_data.label_frontiers \
   --label_mode hybrid
 ```
 
+最终训练不要直接用上面的非严格 `hybrid`。如果只是检查 raw 是否具备 hindsight/oracle 标签，可以用严格混合模式：
+
+```bash
+python -m gnn_data.label_frontiers \
+  --input_dir data/gnn_raw/mp3d/train50 \
+  --output_dir data/gnn_labeled_strict_check/mp3d/train50 \
+  --label_mode hybrid_hindsight_first_strict \
+  --strict_labels \
+  --skip_unlabeled \
+  --write_label_report
+```
+
 ### 4. 转成稀疏决策图
 
 ```bash
 python -m gnn_train.convert_raw_to_graph \
   --input_dir data/gnn_labeled/mp3d/train \
   --output_dir data/gnn_graph/mp3d/train \
-  --max_frontier_clusters 32
+  --max_frontier_clusters 32 \
+  --strict_label_aggregation \
+  --forbid_distance_label_fallback \
+  --write_conversion_report
 ```
 
 ### 5. 训练 Frontier GNN

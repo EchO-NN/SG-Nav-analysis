@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import copy
-from typing import Dict, Iterable, List, Optional
+from collections import defaultdict
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -157,37 +158,101 @@ def make_label_payload(costs, tau: float, label_type: str, extra: Optional[Dict]
     return payload
 
 
-def label_with_goal_rc(sample: dict, goal_rc, tau: float, lambda_goal: float, label_type: str) -> dict:
+def label_with_goal_rc(
+    sample: dict,
+    goal_rc,
+    tau: float,
+    lambda_goal: float,
+    label_type: str,
+    label_source: str = "sample_goal_rc",
+) -> dict:
     out = copy.deepcopy(sample)
     costs = frontier_to_goal_cost(out, goal_rc=goal_rc, lambda_goal=lambda_goal, prefer_fmm=True)
     out["labels"] = make_label_payload(
         costs,
         tau=tau,
         label_type=label_type,
-        extra={"hindsight_goal_rc": torch.tensor(goal_rc, dtype=torch.float32)},
+        extra={
+            "hindsight_goal_rc": torch.tensor(goal_rc, dtype=torch.float32),
+            "label_source": label_source,
+        },
     )
     return out
 
 
-def pseudo_goal_objects(sample: dict, min_confidence: float = 0.5) -> List[dict]:
+def _first_numeric(obj: dict, keys: Sequence[str], default=0):
+    for key in keys:
+        if key in obj and obj[key] is not None:
+            try:
+                return float(obj[key])
+            except Exception:
+                pass
+    return default
+
+
+def _valid_category(category: str, exclude_unknown: bool) -> bool:
+    if not category:
+        return False
+    if not exclude_unknown:
+        return True
+    bad = {"object", "unknown", "misc", "background", "none", "null", "__unknown__"}
+    return category.strip().lower() not in bad
+
+
+def pseudo_goal_objects(
+    sample: dict,
+    min_confidence: float = 0.5,
+    min_observed_count: int = 1,
+    min_lifetime_steps: int = 0,
+    max_per_category: int = 0,
+    exclude_unknown: bool = False,
+    exclude_rejected_candidates: bool = False,
+    balance_categories: bool = False,
+) -> List[dict]:
     out = []
+    per_category = defaultdict(int)
     for obj in sample.get("scenegraph", {}).get("objects", []):
         center = obj.get("center_rc")
         if center is None:
             continue
+        category = str(obj.get("category", obj.get("caption", "object")))
+        if not _valid_category(category, exclude_unknown=exclude_unknown):
+            continue
+        if exclude_rejected_candidates and bool(obj.get("rejected_candidate", False)):
+            continue
         confidence = float(obj.get("confidence", 1.0))
         if confidence < min_confidence:
+            continue
+        observed_count = int(_first_numeric(obj, ["observed_count", "num_detections", "count"], default=1))
+        if observed_count < int(min_observed_count):
+            continue
+        first_seen = _first_numeric(obj, ["first_seen_step"], default=obj.get("last_seen_step", 0) or 0)
+        last_seen = _first_numeric(obj, ["last_seen_step"], default=first_seen)
+        lifetime = int(max(0, last_seen - first_seen))
+        if lifetime < int(min_lifetime_steps):
+            continue
+        if max_per_category and per_category[category] >= int(max_per_category):
             continue
         center = as_numpy(center).astype(np.float32).reshape(-1)
         if center.size < 2 or not np.isfinite(center[:2]).all():
             continue
+        map_size = int(sample.get("metadata", {}).get("map_size", 0))
+        if map_size > 0 and not (0 <= center[0] < map_size and 0 <= center[1] < map_size):
+            continue
+        per_category[category] += 1
         out.append(
             {
-                "goal_text": str(obj.get("category", obj.get("caption", "object"))),
+                "goal_text": category,
                 "goal_rc": center[:2].astype(np.float32),
                 "source_node_id": obj.get("node_id"),
                 "confidence": confidence,
+                "observed_count": observed_count,
+                "first_seen_step": int(first_seen),
+                "last_seen_step": int(last_seen),
+                "lifetime_steps": int(lifetime),
+                "rejected_candidate": bool(obj.get("rejected_candidate", False)),
             }
         )
+    if balance_categories:
+        out = sorted(out, key=lambda item: (item["goal_text"], -item["confidence"], -item["observed_count"]))
     return out
-

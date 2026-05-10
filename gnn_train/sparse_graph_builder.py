@@ -64,21 +64,42 @@ def _clusters_from_points(sample: dict, max_frontiers: int) -> List[FrontierClus
     return clusters
 
 
-def extract_frontier_clusters(sample: dict, max_frontiers: int = 32, min_cluster_size: int = 3):
+def extract_frontier_clusters(
+    sample: dict,
+    max_frontiers: int = 32,
+    min_cluster_size: int = 3,
+    strict_frontier_clusters: bool = False,
+    allow_point_frontiers_debug: bool = True,
+    report: Optional[Dict] = None,
+):
     frontier = sample.get("frontier", {})
     frontier_map = frontier.get("frontier_map")
     fmm_dist = frontier.get("fmm_dist")
     if frontier_map is not None and fmm_dist is not None:
         try:
-            return cluster_frontiers(
+            clusters = cluster_frontiers(
                 np.asarray(frontier_map).astype(bool),
                 _np(fmm_dist, dtype=np.float32),
                 min_path_dist=1.6,
                 max_frontiers=max_frontiers,
                 min_cluster_size=min_cluster_size,
             )
+            if len(clusters) > 0:
+                return clusters
+            if report is not None:
+                report["cluster_label_missing_count"] = report.get("cluster_label_missing_count", 0) + 1
         except Exception:
-            pass
+            if report is not None:
+                report["cluster_extraction_error_count"] = report.get("cluster_extraction_error_count", 0) + 1
+            if strict_frontier_clusters and not allow_point_frontiers_debug:
+                raise
+    elif report is not None:
+        report["cluster_missing_frontier_map_count"] = report.get("cluster_missing_frontier_map_count", 0) + 1
+
+    if strict_frontier_clusters and not allow_point_frontiers_debug:
+        raise ValueError("strict frontier clustering failed and point fallback is disabled")
+    if report is not None:
+        report["cluster_fallback_to_points_count"] = report.get("cluster_fallback_to_points_count", 0) + 1
     return _clusters_from_points(sample, max_frontiers=max_frontiers)
 
 
@@ -98,6 +119,9 @@ def aggregate_labels_to_clusters(
     clusters: List[FrontierCluster],
     tau: float = 2.0,
     teacher_temperature: float = 1.0,
+    strict_label_aggregation: bool = False,
+    forbid_distance_label_fallback: bool = False,
+    report: Optional[Dict] = None,
 ) -> Dict:
     labels = sample.get("labels", {})
     frontier = sample.get("frontier", {})
@@ -128,11 +152,21 @@ def aggregate_labels_to_clusters(
             vals = cost_map[cluster.member_rcs[:, 0], cluster.member_rcs[:, 1]]
             vals = vals[np.isfinite(vals)]
             if len(vals) == 0:
+                if strict_label_aggregation:
+                    if report is not None:
+                        report["cluster_label_missing_count"] = report.get("cluster_label_missing_count", 0) + 1
+                    raise ValueError("missing raw labels for frontier cluster")
                 idx = int(np.argmin(np.linalg.norm(centers - cluster.center_rc.reshape(1, 2), axis=1)))
                 vals = np.asarray([raw_costs[idx]], dtype=np.float32)
             cluster_costs.append(float(np.min(vals)))
         cluster_costs = np.asarray(cluster_costs, dtype=np.float32)
     else:
+        if strict_label_aggregation or forbid_distance_label_fallback:
+            if report is not None:
+                report["distance_only_label_count"] = report.get("distance_only_label_count", 0) + 1
+            raise ValueError("missing frontier labels; distance-only label fallback is forbidden")
+        if report is not None:
+            report["distance_only_label_count"] = report.get("distance_only_label_count", 0) + 1
         cluster_costs = np.asarray([c.mean_path_dist for c in clusters], dtype=np.float32)
 
     y_soft = make_soft_frontier_label(cluster_costs, tau=tau)
@@ -178,13 +212,22 @@ class RawSampleGraphConverter:
         room_names: Optional[List[str]] = None,
         max_frontier_clusters: int = 32,
         min_cluster_size: int = 3,
+        strict_frontier_clusters: bool = False,
+        strict_label_aggregation: bool = False,
+        forbid_distance_label_fallback: bool = False,
+        allow_point_frontiers_debug: bool = True,
         device: str = "cpu",
     ):
         self.text_encoder = text_encoder
         self.room_names = list(room_names or DEFAULT_ROOM_NAMES)
         self.max_frontier_clusters = int(max_frontier_clusters)
         self.min_cluster_size = int(min_cluster_size)
+        self.strict_frontier_clusters = bool(strict_frontier_clusters)
+        self.strict_label_aggregation = bool(strict_label_aggregation)
+        self.forbid_distance_label_fallback = bool(forbid_distance_label_fallback)
+        self.allow_point_frontiers_debug = bool(allow_point_frontiers_debug)
         self.device = device
+        self.last_report = {}
 
     def build_from_raw_sample(self, sample: dict, tau: float = 2.0, teacher_temperature: float = 1.0) -> dict:
         metadata = sample.get("metadata", {})
@@ -205,10 +248,14 @@ class RawSampleGraphConverter:
             frontier_radius_m=4.0,
             device=self.device,
         )
+        report = {}
         clusters = extract_frontier_clusters(
             sample,
             max_frontiers=self.max_frontier_clusters,
             min_cluster_size=self.min_cluster_size,
+            strict_frontier_clusters=self.strict_frontier_clusters,
+            allow_point_frontiers_debug=self.allow_point_frontiers_debug,
+            report=report,
         )
         scenegraph = SimpleNamespace(
             nodes=sample.get("scenegraph", {}).get("objects", []),
@@ -235,7 +282,13 @@ class RawSampleGraphConverter:
             clusters,
             tau=tau,
             teacher_temperature=teacher_temperature,
+            strict_label_aggregation=self.strict_label_aggregation,
+            forbid_distance_label_fallback=self.forbid_distance_label_fallback,
+            report=report,
         )
+        report["raw_frontier_count"] = int(len(_np(sample.get("frontier", {}).get("frontier_locations_valid_rc", []))))
+        report["cluster_frontier_count"] = int(len(clusters))
+        self.last_report = report
         return {
             "version": "gnn_graph_step_v1",
             "graph": {
@@ -255,5 +308,5 @@ class RawSampleGraphConverter:
             "metadata": metadata,
             "goal": sample.get("goal", {}),
             "source_version": sample.get("version", ""),
+            "conversion_report": report,
         }
-

@@ -51,6 +51,8 @@ def _record(costs, scores, best_idx):
         "top3": float(best_idx in order[: min(3, len(order))]),
         "chosen": float(finite_costs[pred]),
         "best": float(finite_costs[best_idx]),
+        "pred": pred,
+        "best_idx": int(best_idx),
     }
 
 
@@ -99,7 +101,25 @@ def evaluate_dataset(dataset, ckpt=None, device="cpu", seed=0):
             if rec:
                 records["gnn"].append(rec)
 
-    return {name: _metrics(vals) for name, vals in records.items() if vals or name != "gnn" or model is not None}
+    metrics = {name: _metrics(vals) for name, vals in records.items() if vals or name != "gnn" or model is not None}
+    gnn_metrics = metrics.get("gnn", {})
+    teacher_metrics = metrics.get("teacher", {})
+    summary = {
+        "pred_oracle_top1": float(gnn_metrics.get("top1", 0.0)),
+        "pred_oracle_top3": float(gnn_metrics.get("top3", 0.0)),
+        "pred_cost_ratio": float(gnn_metrics.get("cost_ratio", 0.0)),
+        "teacher_cost_ratio": float(teacher_metrics.get("cost_ratio", 0.0)),
+        "distance_cost_ratio": float(metrics.get("distance", {}).get("cost_ratio", 0.0)),
+        "random_cost_ratio": float(metrics.get("random", {}).get("cost_ratio", 0.0)),
+        "teacher_oracle_agreement": float(teacher_metrics.get("top1", 0.0)),
+        "pred_teacher_agreement": 0.0,
+    }
+    if records.get("gnn") and records.get("teacher"):
+        pairs = zip(records["gnn"], records["teacher"])
+        vals = [float(g["pred"] == t["pred"]) for g, t in pairs]
+        summary["pred_teacher_agreement"] = float(np.mean(vals)) if vals else 0.0
+    metrics["summary"] = summary
+    return metrics
 
 
 def main():
@@ -122,4 +142,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
