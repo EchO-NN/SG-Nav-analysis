@@ -61,15 +61,15 @@ def _path_distances(sample):
     return _np(distances).astype(np.float32).reshape(-1)
 
 
-def _final_traversible(summary):
+def _final_traversible(summary, require_free_map=True, allow_full_map_debug=False):
     final_maps = summary.get("final_maps", {})
     free_map = _map_2d(final_maps.get("free_map"))
     if free_map is not None and free_map.size:
-        return (free_map > 0.5).astype(np.float32)
+        return (free_map > 0.5).astype(np.float32), "final_free_map"
     full_map = _map_2d(final_maps.get("full_map"))
-    if full_map is not None and full_map.size:
-        return (full_map > 0.5).astype(np.float32)
-    return None
+    if full_map is not None and full_map.size and (allow_full_map_debug or not require_free_map):
+        return (full_map > 0.5).astype(np.float32), "final_full_map_debug"
+    return None, "missing_final_free_map" if require_free_map else "missing_final_map"
 
 
 def _fmm_distance_map(traversible, goal_rc):
@@ -110,6 +110,10 @@ def label_step_with_final_map(
     output_label_type="hindsight_goal_final_map",
     label_source="episode_summary_final_map",
     episode_summary_path=None,
+    forbid_sim_gt_debug=True,
+    allow_sim_gt_debug_for_diagnostic=False,
+    require_final_free_map=True,
+    allow_final_full_map_debug=False,
 ):
     metadata = step_sample.get("metadata", {})
     frontiers = _frontiers(step_sample)
@@ -121,13 +125,26 @@ def label_step_with_final_map(
         raise ValueError("skipped_missing_path_distance")
 
     target_goal = episode_summary.get("target_goal", {})
+    target_goal_source = str(target_goal.get("source", "unknown"))
+    if (
+        target_goal_source == "sim_gt_debug"
+        and bool(forbid_sim_gt_debug)
+        and not bool(allow_sim_gt_debug_for_diagnostic)
+    ):
+        raise ValueError("skipped_sim_gt_debug_target")
     goal_rc = _np(target_goal.get("found_goal_rc"))
     if goal_rc is None:
         raise ValueError("skipped_no_found_goal")
     goal_rc = goal_rc.astype(np.float32).reshape(-1)[:2]
 
-    traversible = _final_traversible(episode_summary)
+    traversible, final_map_source = _final_traversible(
+        episode_summary,
+        require_free_map=require_final_free_map,
+        allow_full_map_debug=allow_final_full_map_debug,
+    )
     if traversible is None:
+        if final_map_source == "missing_final_free_map":
+            raise ValueError("skipped_missing_final_free_map")
         raise ValueError("skipped_missing_final_map")
     dist_map = _fmm_distance_map(traversible, goal_rc)
     map_resolution_cm = float(metadata.get("map_resolution_cm", 5.0))
@@ -158,7 +175,8 @@ def label_step_with_final_map(
         "found_goal_rc": torch.tensor(goal_rc, dtype=torch.float32),
         "frontier_goal_final_map_dist": torch.tensor(d_goal, dtype=torch.float32),
         "episode_summary_path": "" if episode_summary_path is None else str(episode_summary_path),
-        "target_goal_source": str(target_goal.get("source", "unknown")),
+        "target_goal_source": target_goal_source,
+        "final_map_source": final_map_source,
     }
     labels.update(_teacher_fields(step_sample))
     out = dict(step_sample)
@@ -193,6 +211,10 @@ def main():
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--skip_unlabeled", action="store_true")
     parser.add_argument("--write_label_report", nargs="?", const="hindsight_label_report.json", default=None)
+    parser.add_argument("--forbid_sim_gt_debug", action="store_true")
+    parser.add_argument("--allow_sim_gt_debug_for_diagnostic", action="store_true")
+    parser.add_argument("--require_final_free_map", action="store_true")
+    parser.add_argument("--allow_final_full_map_debug", action="store_true")
     args = parser.parse_args()
 
     summaries = load_summaries(args.episode_summary_dir)
@@ -203,8 +225,12 @@ def main():
 
     label_type_counts = Counter()
     skip_reason_counts = Counter()
+    target_goal_source_counts = Counter()
+    final_map_source_counts = Counter()
     episode_counts = Counter()
     count = 0
+    forbid_sim_gt_debug = bool(args.forbid_sim_gt_debug or not args.allow_sim_gt_debug_for_diagnostic)
+    require_final_free_map = bool(args.require_final_free_map or not args.allow_final_full_map_debug)
     for path in paths:
         sample = safe_torch_load(path, map_location="cpu")
         key = _episode_key(sample.get("metadata", {}))
@@ -229,6 +255,10 @@ def main():
                 output_label_type="hindsight_goal_final_map",
                 label_source=f"episode_summary_{summary.get('target_goal', {}).get('source', 'found_goal')}",
                 episode_summary_path=candidates[-1][0],
+                forbid_sim_gt_debug=forbid_sim_gt_debug,
+                allow_sim_gt_debug_for_diagnostic=args.allow_sim_gt_debug_for_diagnostic,
+                require_final_free_map=require_final_free_map,
+                allow_final_full_map_debug=args.allow_final_full_map_debug,
             )
         except Exception as exc:
             reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"
@@ -245,6 +275,8 @@ def main():
         os.replace(tmp_path, out_path)
         count += 1
         label_type_counts[str(labeled["labels"]["label_type"])] += 1
+        target_goal_source_counts[str(labeled["labels"].get("target_goal_source", "missing"))] += 1
+        final_map_source_counts[str(labeled["labels"].get("final_map_source", "missing"))] += 1
 
     report = {
         "raw_step_dir": args.raw_step_dir,
@@ -254,8 +286,18 @@ def main():
         "num_labeled_samples": count,
         "label_type_counts": dict(label_type_counts),
         "skip_reason_counts": dict(skip_reason_counts),
+        "target_goal_source_counts": dict(target_goal_source_counts),
+        "final_map_source_counts": dict(final_map_source_counts),
+        "forbid_sim_gt_debug": bool(forbid_sim_gt_debug),
+        "allow_sim_gt_debug_for_diagnostic": bool(args.allow_sim_gt_debug_for_diagnostic),
+        "require_final_free_map": bool(require_final_free_map),
+        "allow_final_full_map_debug": bool(args.allow_final_full_map_debug),
         "episode_step_counts": {f"{k[0]}::{k[1]}": v for k, v in episode_counts.items()},
     }
+    if forbid_sim_gt_debug and target_goal_source_counts.get("sim_gt_debug", 0) > 0:
+        raise RuntimeError("strict hindsight relabeling produced sim_gt_debug target labels")
+    if require_final_free_map and final_map_source_counts.get("final_full_map_debug", 0) > 0:
+        raise RuntimeError("strict hindsight relabeling used final_full_map_debug")
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if args.write_label_report:
         report_path = Path(args.write_label_report)

@@ -176,6 +176,7 @@ class EpisodeSummaryLogger:
             discovered_objects.append(item)
 
         fallback_records = list(getattr(agent, "gnn_fallback_records", []) or [])
+        fallback_decision_records = list(getattr(agent, "gnn_fallback_decision_records", []) or [])
 
         target_goal = _found_goal_payload(agent, metrics)
         final_maps = {
@@ -187,6 +188,8 @@ class EpisodeSummaryLogger:
         fallback = {
             "num_fallback_calls": len(fallback_records),
             "fallback_records": fallback_records,
+            "num_fallback_decisions": len(fallback_decision_records),
+            "fallback_decision_records": fallback_decision_records,
         }
         debug = {
             "rejected_goal_candidates": rejected,

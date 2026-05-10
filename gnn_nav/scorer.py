@@ -1,4 +1,5 @@
 import os
+import time
 
 import numpy as np
 import torch
@@ -52,6 +53,7 @@ class GNNFrontierScorer:
                 return scores, {"num_object_nodes": 0, "num_frontiers": 0}
             return scores
 
+        build_start = time.perf_counter()
         graph = self.builder.build(
             scenegraph=scenegraph,
             frontier_clusters=frontier_clusters,
@@ -65,19 +67,24 @@ class GNNFrontierScorer:
             current_step=current_step,
             candidate_goals=candidate_goals,
         )
+        sparse_graph_build_time = time.perf_counter() - build_start
         graph_info = dict(getattr(graph, "metadata", {}) or {})
+        graph_info["sparse_graph_build_time"] = float(sparse_graph_build_time)
 
         if self.model is None:
             if self.fallback_to_distance:
                 scores = np.asarray([c.distance_inverse for c in frontier_clusters], dtype=np.float32)
             else:
                 scores = np.zeros((len(frontier_clusters),), dtype=np.float32)
+            graph_info["gnn_forward_time"] = 0.0
             if return_graph_info:
                 return scores, graph_info
             return scores
 
         graph = graph.to(self.device)
+        forward_start = time.perf_counter()
         out = self.model(graph)
+        graph_info["gnn_forward_time"] = float(time.perf_counter() - forward_start)
         logits = out["frontier_logits"].detach().cpu().numpy()
         scores = logits.astype(np.float32)
         if return_graph_info:

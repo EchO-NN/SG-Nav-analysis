@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -69,13 +70,7 @@ def validate_summary(summary, strict=False):
     return errors
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str, required=True)
-    parser.add_argument("--strict", action="store_true")
-    args = parser.parse_args()
-
-    summary = safe_torch_load(args.path, map_location="cpu")
+def print_summary(path, summary, strict=False):
     metadata = summary.get("metadata", {})
     target_goal = summary.get("target_goal", {})
     final_maps = summary.get("final_maps", {})
@@ -85,7 +80,7 @@ def main():
     rejected = debug.get("rejected_goal_candidates", [])
     stable_objects = [obj for obj in objects if obj.get("stable")]
 
-    print("path:", args.path)
+    print("path:", path)
     print("version:", summary.get("version"))
     print("scene_id:", metadata.get("scene_id"))
     print("episode_id:", metadata.get("episode_id"))
@@ -106,6 +101,7 @@ def main():
     print("num_stable_objects:", len(stable_objects))
     print("num_rejected_candidates:", len(rejected))
     print("num_fallback_calls:", fallback.get("num_fallback_calls", 0))
+    print("num_fallback_decisions:", fallback.get("num_fallback_decisions", 0))
     print(
         "flat_aliases_present:",
         all(
@@ -127,11 +123,65 @@ def main():
         ),
     )
 
-    errors = validate_summary(summary, strict=args.strict)
+    errors = validate_summary(summary, strict=strict)
     if errors:
         print("validation_errors:")
         for err in errors:
             print(" -", err)
+        return False, errors
+    print("validation: ok")
+    return True, []
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--path", type=str, default=None)
+    parser.add_argument("--dir", type=str, default=None)
+    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--max_print", type=int, default=3)
+    args = parser.parse_args()
+
+    if bool(args.path) == bool(args.dir):
+        parser.error("provide exactly one of --path or --dir")
+
+    if args.path:
+        summary = safe_torch_load(args.path, map_location="cpu")
+        ok, _ = print_summary(args.path, summary, strict=args.strict)
+        if not ok:
+            raise SystemExit(1)
+        return
+
+    paths = sorted(Path(args.dir).rglob("*.pt"))
+    source_counts = Counter()
+    map_presence = Counter()
+    failures = []
+    printed = 0
+    for path in paths:
+        summary = safe_torch_load(path, map_location="cpu")
+        validation_errors = validate_summary(summary, strict=args.strict)
+        if validation_errors:
+            failures.append((path, validation_errors))
+        target_goal = summary.get("target_goal", {})
+        final_maps = summary.get("final_maps", {})
+        source_counts[str(target_goal.get("source", "missing"))] += 1
+        map_presence["free_map"] += int(_is_present(final_maps.get("free_map")))
+        map_presence["full_map"] += int(_is_present(final_maps.get("full_map")))
+        map_presence["room_map"] += int(_is_present(final_maps.get("room_map")))
+        if printed < int(args.max_print):
+            print_summary(path, summary, strict=args.strict)
+            printed += 1
+
+    print("dir:", args.dir)
+    print("num_episode_summaries:", len(paths))
+    print("target_goal_source_counts:", dict(source_counts))
+    print("final_map_presence_counts:", dict(map_presence))
+    print("validation_failed_count:", len(failures))
+    if failures:
+        print("validation_failures:")
+        for path, errors in failures[:20]:
+            print(" -", path)
+            for err in errors:
+                print("   *", err)
         raise SystemExit(1)
     print("validation: ok")
 

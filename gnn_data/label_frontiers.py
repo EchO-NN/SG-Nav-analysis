@@ -153,6 +153,10 @@ def label_sample(
     episode_summary: dict = None,
     episode_summary_path: str = None,
     allow_failed_hindsight_debug: bool = False,
+    forbid_sim_gt_debug: bool = False,
+    allow_sim_gt_debug_for_diagnostic: bool = False,
+    require_final_free_map: bool = False,
+    allow_final_full_map_debug: bool = False,
 ):
     original_label_mode = label_mode
     label_mode = _canonical_mode(label_mode)
@@ -162,6 +166,9 @@ def label_sample(
         forbid_teacher_fallback = True if final_mode else forbid_teacher_fallback
         forbid_approx_fallback = True if final_mode else forbid_approx_fallback
         require_hindsight_or_oracle = True if final_mode else require_hindsight_or_oracle
+        if final_mode:
+            forbid_sim_gt_debug = forbid_sim_gt_debug or not allow_sim_gt_debug_for_diagnostic
+            require_final_free_map = require_final_free_map or not allow_final_full_map_debug
     if label_mode == "hindsight_goal_strict":
         label_mode = "hindsight_goal"
     if label_mode == "hybrid_hindsight_first_strict":
@@ -240,6 +247,10 @@ def label_sample(
                 output_label_type="final_map_hindsight_strict",
                 label_source="episode_summary_final_map",
                 episode_summary_path=episode_summary_path,
+                forbid_sim_gt_debug=forbid_sim_gt_debug,
+                allow_sim_gt_debug_for_diagnostic=allow_sim_gt_debug_for_diagnostic,
+                require_final_free_map=require_final_free_map,
+                allow_final_full_map_debug=allow_final_full_map_debug,
             )
         except Exception as exc:
             reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"
@@ -257,6 +268,7 @@ def label_sample(
             "frontier_goal_final_map_dist",
             "episode_summary_path",
             "target_goal_source",
+            "final_map_source",
         ]:
             extra_label_fields[key] = sample["labels"].get(key)
     elif label_mode == "hybrid":
@@ -384,6 +396,14 @@ def label_samples(
     if strict_all_objects and episode_summary is None:
         raise SkipSample("skipped_missing_episode_summary")
     if strict_all_objects and episode_summary is not None:
+        source = str(episode_summary.get("target_goal", {}).get("source", "unknown"))
+        if (
+            source == "sim_gt_debug"
+            and bool(label_kwargs.get("forbid_sim_gt_debug", False))
+            and not bool(label_kwargs.get("allow_sim_gt_debug_for_diagnostic", False))
+        ):
+            raise SkipSample("skipped_sim_gt_debug_target")
+    if strict_all_objects and episode_summary is not None:
         pseudo_source_sample = copy.deepcopy(sample)
         pseudo_source_sample.setdefault("scenegraph", {})
         pseudo_source_sample["scenegraph"] = dict(pseudo_source_sample["scenegraph"])
@@ -439,6 +459,12 @@ def label_samples(
                     output_label_type="hindsight_all_objects_strict",
                     label_source="episode_summary_discovered_object",
                     episode_summary_path=episode_summary_path,
+                    forbid_sim_gt_debug=bool(label_kwargs.get("forbid_sim_gt_debug", False)),
+                    allow_sim_gt_debug_for_diagnostic=bool(
+                        label_kwargs.get("allow_sim_gt_debug_for_diagnostic", False)
+                    ),
+                    require_final_free_map=bool(label_kwargs.get("require_final_free_map", False)),
+                    allow_final_full_map_debug=bool(label_kwargs.get("allow_final_full_map_debug", False)),
                 )
             except Exception as exc:
                 reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"
@@ -519,6 +545,10 @@ def main():
     parser.add_argument("--write_label_report", nargs="?", const="label_report.json", default=None)
     parser.add_argument("--allow_unvalidated_geodesic", action="store_true")
     parser.add_argument("--allow_failed_hindsight_debug", action="store_true")
+    parser.add_argument("--forbid_sim_gt_debug", action="store_true")
+    parser.add_argument("--allow_sim_gt_debug_for_diagnostic", action="store_true")
+    parser.add_argument("--require_final_free_map", action="store_true")
+    parser.add_argument("--allow_final_full_map_debug", action="store_true")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--skip_errors", action="store_true")
     args = parser.parse_args()
@@ -534,7 +564,17 @@ def main():
     label_type_counts = Counter()
     skip_reason_counts = Counter()
     pseudo_goal_category_counts = Counter()
+    target_goal_source_counts = Counter()
+    final_map_source_counts = Counter()
     output_dir = Path(args.output_dir)
+    strict_labels_effective = bool(args.strict_labels or str(args.label_mode).endswith("_strict"))
+    final_mode_effective = bool(args.label_mode in FINAL_LABEL_MODES)
+    forbid_sim_gt_debug = bool(
+        args.forbid_sim_gt_debug or (strict_labels_effective and final_mode_effective and not args.allow_sim_gt_debug_for_diagnostic)
+    )
+    require_final_free_map = bool(
+        args.require_final_free_map or (strict_labels_effective and final_mode_effective and not args.allow_final_full_map_debug)
+    )
     for path in paths:
         try:
             sample = safe_torch_load(path, map_location="cpu")
@@ -569,6 +609,10 @@ def main():
                 episode_summary=episode_summary,
                 episode_summary_path=episode_summary_path,
                 allow_failed_hindsight_debug=args.allow_failed_hindsight_debug,
+                forbid_sim_gt_debug=forbid_sim_gt_debug,
+                allow_sim_gt_debug_for_diagnostic=args.allow_sim_gt_debug_for_diagnostic,
+                require_final_free_map=require_final_free_map,
+                allow_final_full_map_debug=args.allow_final_full_map_debug,
             )
         except SkipSample as exc:
             if args.skip_unlabeled or args.skip_errors or args.strict_labels:
@@ -603,6 +647,12 @@ def main():
             pseudo_goal_text = labeled_sample.get("labels", {}).get("pseudo_goal_text")
             if pseudo_goal_text is not None:
                 pseudo_goal_category_counts[str(pseudo_goal_text)] += 1
+            target_goal_source = labeled_sample.get("labels", {}).get("target_goal_source")
+            if target_goal_source is not None:
+                target_goal_source_counts[str(target_goal_source)] += 1
+            final_map_source = labeled_sample.get("labels", {}).get("final_map_source")
+            if final_map_source is not None:
+                final_map_source_counts[str(final_map_source)] += 1
 
     report = {
         "input_dir": args.input_dir,
@@ -615,15 +665,26 @@ def main():
         "label_type_counts": dict(label_type_counts),
         "skip_reason_counts": dict(skip_reason_counts),
         "pseudo_goal_category_counts": dict(pseudo_goal_category_counts),
+        "target_goal_source_counts": dict(target_goal_source_counts),
+        "final_map_source_counts": dict(final_map_source_counts),
         "strict_labels": bool(args.strict_labels),
+        "strict_labels_effective": bool(strict_labels_effective),
         "forbid_teacher_fallback": bool(args.forbid_teacher_fallback),
         "forbid_approx_fallback": bool(args.forbid_approx_fallback),
         "require_hindsight_or_oracle": bool(args.require_hindsight_or_oracle),
+        "forbid_sim_gt_debug": bool(forbid_sim_gt_debug),
+        "allow_sim_gt_debug_for_diagnostic": bool(args.allow_sim_gt_debug_for_diagnostic),
+        "require_final_free_map": bool(require_final_free_map),
+        "allow_final_full_map_debug": bool(args.allow_final_full_map_debug),
     }
-    if (args.strict_labels or args.forbid_teacher_fallback) and label_type_counts.get("teacher_debug_fallback", 0) > 0:
+    if (strict_labels_effective or args.forbid_teacher_fallback) and label_type_counts.get("teacher_debug_fallback", 0) > 0:
         raise RuntimeError("strict labeling produced teacher_debug_fallback labels")
-    if (args.strict_labels or args.forbid_approx_fallback) and label_type_counts.get("oracle_approx_map_fallback", 0) > 0:
+    if (strict_labels_effective or args.forbid_approx_fallback) and label_type_counts.get("oracle_approx_map_fallback", 0) > 0:
         raise RuntimeError("strict labeling produced oracle_approx_map_fallback labels")
+    if forbid_sim_gt_debug and target_goal_source_counts.get("sim_gt_debug", 0) > 0:
+        raise RuntimeError("strict labeling produced sim_gt_debug target labels")
+    if require_final_free_map and final_map_source_counts.get("final_full_map_debug", 0) > 0:
+        raise RuntimeError("strict labeling used final_full_map_debug")
 
     print(f"labeled {count} samples -> {args.output_dir}")
     print("label_type_counts:", dict(label_type_counts))

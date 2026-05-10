@@ -54,6 +54,18 @@ def _sim(agent):
     return None
 
 
+def _config_value(config, dotted_path: str, default="unknown"):
+    obj = config
+    for part in dotted_path.split("."):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            obj = obj.get(part, default)
+        else:
+            obj = getattr(obj, part, default)
+    return default if obj is None else obj
+
+
 def extract_goal(agent) -> Dict[str, Any]:
     episode = _episode(agent)
     raw_goal = getattr(episode, "object_category", getattr(agent, "obj_goal", ""))
@@ -143,6 +155,7 @@ def extract_scenegraph_summary(agent, save_edges: bool = False) -> Dict[str, Any
                 "center_world": None if center_world is None else np.asarray(center_world, dtype=np.float32),
                 "confidence": float(safe_get_confidence(node)),
                 "observed_count": int(max(1, round(float(safe_get_observed_count(node))))),
+                "first_seen_step": _safe_scalar(getattr(node, "first_seen_step", None), None),
                 "last_seen_step": _safe_scalar(getattr(node, "last_seen_step", None), None),
                 "is_goal_node": bool(getattr(node, "is_goal_node", False)),
                 "room_id": room_id,
@@ -187,7 +200,7 @@ def extract_metadata(agent, data_tag: str = "sgnav_teacher") -> Dict[str, Any]:
     episode = _episode(agent)
     return {
         "dataset": "mp3d",
-        "split": "unknown",
+        "split": str(_config_value(getattr(agent, "config", None), "DATASET.SPLIT", "unknown")),
         "scene_id": getattr(episode, "scene_id", "unknown_scene"),
         "episode_id": getattr(episode, "episode_id", "unknown_episode"),
         "step_id": int(getattr(agent, "total_steps", 0)),

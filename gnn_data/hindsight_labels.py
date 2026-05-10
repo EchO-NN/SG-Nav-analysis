@@ -81,17 +81,18 @@ def _map_2d(value):
     return arr
 
 
-def _final_free_map(sample: dict):
+def _final_free_map(sample: dict, require_explicit_final: bool = False):
     maps = sample.get("maps", {})
-    for key in ["final_free_map", "free_map", "full_map"]:
+    keys = ["final_free_map"] if require_explicit_final else ["final_free_map", "free_map", "full_map"]
+    for key in keys:
         out = _map_2d(maps.get(key))
         if out is not None and out.size:
             return out
     return None
 
 
-def _fmm_distance_to_goal(sample: dict, goal_rc: np.ndarray):
-    free_map = _final_free_map(sample)
+def _fmm_distance_to_goal(sample: dict, goal_rc: np.ndarray, require_explicit_final: bool = False):
+    free_map = _final_free_map(sample, require_explicit_final=require_explicit_final)
     if free_map is None:
         return None
     try:
@@ -131,7 +132,11 @@ def frontier_to_goal_cost(
     map_resolution_cm = float(sample.get("metadata", {}).get("map_resolution_cm", 5.0))
     goal_dist = None
     if prefer_fmm:
-        dist_map = _fmm_distance_to_goal(sample, goal_rc)
+        dist_map = _fmm_distance_to_goal(
+            sample,
+            goal_rc,
+            require_explicit_final=not allow_approx_fallback,
+        )
         if dist_map is not None:
             vals = []
             for center in centers:

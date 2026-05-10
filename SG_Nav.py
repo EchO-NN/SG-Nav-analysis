@@ -3,6 +3,7 @@ import copy
 import json
 import math
 import os
+import time
 from matplotlib import colors
 import cv2
 import numpy as np
@@ -161,8 +162,10 @@ class SG_Nav_Agent():
         self.gnn_logger = None
         self.gnn_raw_logger = None
         self.gnn_episode_summary_logger = None
+        self.gnn_episode_summary_logged = False
         self.gnn_fallback_policy = None
         self.gnn_fallback_records = []
+        self.gnn_fallback_decision_records = []
         self.current_gnn_fallback_record = None
         self.gnn_raw_samples_saved = 0
         self.gnn_raw_samples_failed = 0
@@ -328,8 +331,10 @@ class SG_Nav_Agent():
         self.text_edge = ''
         self.stop_reason = ''
         self.episode_logged = False
+        self.gnn_episode_summary_logged = False
         self.reset_reperception_state()
         self.gnn_fallback_records = []
+        self.gnn_fallback_decision_records = []
         self.current_gnn_fallback_record = None
         self.gnn_raw_samples_saved = 0
         self.gnn_raw_samples_failed = 0
@@ -986,9 +991,18 @@ class SG_Nav_Agent():
         if not bool(getattr(self.args, "gnn_log_fallback", False)):
             return
         try:
-            self.gnn_fallback_records.append(self._json_safe(record))
+            safe_record = self._json_safe(record)
+            self.gnn_fallback_decision_records.append(safe_record)
+            if bool(safe_record.get("use_fallback", safe_record.get("used_fallback", False))):
+                self.gnn_fallback_records.append(safe_record)
         except Exception as exc:
             self.handle_gnn_logging_error(exc, "fallback_logger")
+
+    def gnn_fallback_enabled(self):
+        return bool(
+            getattr(self.args, "gnn_enable_fallback", False)
+            or getattr(self.args, "gnn_use_fallback", False)
+        )
 
     def log_gnn_raw_sample(
         self,
@@ -1078,6 +1092,7 @@ class SG_Nav_Agent():
         if len(frontier_clusters) == 0:
             return None
 
+        score_start = time.perf_counter()
         score_result = self.gnn_scorer.score(
             scenegraph=self.scenegraph,
             frontier_clusters=frontier_clusters,
@@ -1091,7 +1106,11 @@ class SG_Nav_Agent():
             current_step=getattr(self, "total_steps", 0),
             return_graph_info=True,
         )
+        scorer_elapsed = time.perf_counter() - score_start
         scores, graph_info = score_result
+        if hasattr(self.scenegraph, "debug_stats"):
+            self.scenegraph.debug_stats.inc("gnn_forward_time", float(graph_info.get("gnn_forward_time", scorer_elapsed)))
+            self.scenegraph.debug_stats.inc("sparse_graph_build_time", float(graph_info.get("sparse_graph_build_time", 0.0)))
         scores = np.asarray(scores, dtype=np.float32).reshape(-1)
         gnn_scores = scores.copy()
         fallback_scores = None
@@ -1099,7 +1118,7 @@ class SG_Nav_Agent():
         fallback_decision = None
         used_fallback = False
 
-        if bool(getattr(self.args, "gnn_use_fallback", False)) and self.gnn_fallback_policy is not None:
+        if self.gnn_fallback_enabled() and self.gnn_fallback_policy is not None:
             fallback_decision = self.gnn_fallback_policy.evaluate(
                 gnn_scores,
                 num_object_nodes=int(graph_info.get("num_objects", graph_info.get("num_object_nodes", 0))),
@@ -1108,15 +1127,18 @@ class SG_Nav_Agent():
             )
             if fallback_decision.use_fallback:
                 mode = getattr(self.args, "gnn_fallback_mode", "sgnav_score")
-                if mode == "sgnav_score":
+                if mode in ["sgnav_score", "original_sgnav_score"]:
                     try:
                         from gnn_nav.fallback_policy import combine_scores
 
+                        fallback_start = time.perf_counter()
                         cluster_centers_shifted = np.stack(
                             [cluster.center_rc for cluster in frontier_clusters],
                             axis=0,
                         ) + 1
                         fallback_scores = self.scenegraph.score(cluster_centers_shifted, len(frontier_clusters))
+                        if hasattr(self.scenegraph, "debug_stats"):
+                            self.scenegraph.debug_stats.inc("fallback_score_time", time.perf_counter() - fallback_start)
                         scores = combine_scores(
                             gnn_scores,
                             fallback_scores,
@@ -1150,9 +1172,12 @@ class SG_Nav_Agent():
                 "step_id": int(getattr(self, "total_steps", 0)),
                 "goal_text": self.obj_goal_sg,
                 "use_fallback": bool(used_fallback),
+                "used_fallback": bool(used_fallback),
                 "fallback_mode": getattr(self.args, "gnn_fallback_mode", "sgnav_score"),
                 "fallback_reasons": list(fallback_decision.reasons),
+                "reasons": list(fallback_decision.reasons),
                 "fallback_metrics": dict(fallback_decision.metrics),
+                "metrics": dict(fallback_decision.metrics),
                 "gnn_scores": gnn_scores.tolist(),
                 "fallback_scores": None
                 if fallback_scores is None
@@ -1165,8 +1190,10 @@ class SG_Nav_Agent():
         if bool(getattr(self.args, "debug_gnn", False)):
             print("[GNN] goal:", self.obj_goal_sg)
             print("[GNN] num_frontier_clusters:", len(frontier_clusters))
+            print("[GNN] score_shape:", list(np.asarray(scores).shape))
             print("[GNN] scores:", np.asarray(scores, dtype=np.float32).tolist())
             print("[GNN] selected:", best_idx, frontier_clusters[best_idx].center_rc.tolist())
+            print("[GNN] fallback_used:", bool(used_fallback))
 
         teacher_scores = None
         if bool(getattr(self.args, "gnn_log", False)):
@@ -1604,10 +1631,20 @@ class SG_Nav_Agent():
         if debug_logger_enabled:
             self.episode_logger.log(row)
         if summary_logger_enabled:
-            try:
-                self.gnn_episode_summary_logger.save_episode(self, metrics)
-            except Exception as exc:
-                self.handle_gnn_logging_error(exc, "episode_logger")
+            self.log_gnn_episode_summary_once(metrics)
+
+    def log_gnn_episode_summary_once(self, metrics):
+        logger = getattr(self, "gnn_episode_summary_logger", None)
+        if getattr(self, "gnn_episode_summary_logged", False):
+            return None
+        if not bool(getattr(logger, "enabled", False)):
+            return None
+        self.gnn_episode_summary_logged = True
+        try:
+            return logger.save_episode(self, metrics)
+        except Exception as exc:
+            self.handle_gnn_logging_error(exc, "episode_summary_logger")
+            return None
 
     def update_visualization_text(self, number_action):
         nodes = self.scenegraph.get_nodes()
@@ -1805,7 +1842,13 @@ def main():
         "--gnn_use_fallback", action="store_true"
     )
     parser.add_argument(
-        "--gnn_fallback_mode", default="sgnav_score", choices=["sgnav_score", "distance", "none"], type=str
+        "--gnn_enable_fallback", action="store_true"
+    )
+    parser.add_argument(
+        "--gnn_fallback_mode",
+        default="sgnav_score",
+        choices=["sgnav_score", "original_sgnav_score", "distance", "none"],
+        type=str,
     )
     parser.add_argument(
         "--gnn_fallback_alpha", default=1.0, type=float
