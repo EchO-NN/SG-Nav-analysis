@@ -3,7 +3,38 @@ import copy
 import json
 import math
 import os
+import sys
 import time
+import warnings
+
+
+def _configure_quiet_runtime_warnings():
+    if os.environ.get("SGNAV_VERBOSE_WARNINGS", "0") == "1":
+        return
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    warnings.filterwarnings("ignore", message="None of the inputs have requires_grad=True.*", category=UserWarning)
+    warnings.filterwarnings("ignore", message="Default grid_sample and affine_grid behavior has changed.*", category=UserWarning)
+    warnings.filterwarnings("ignore", message="nn\\.functional\\.upsample_bilinear is deprecated.*", category=UserWarning)
+    warnings.filterwarnings("ignore", message="floor_divide is deprecated.*", category=UserWarning)
+    warnings.filterwarnings("ignore", message="Failed to load custom C\\+\\+ ops.*", category=UserWarning)
+    try:
+        import gym_notices.notices as gym_notices
+
+        gym_notices.notices.clear()
+    except Exception:
+        pass
+    try:
+        from transformers.utils import logging as transformers_logging
+
+        transformers_logging.set_verbosity_error()
+    except Exception:
+        pass
+
+
+_configure_quiet_runtime_warnings()
+
 from matplotlib import colors
 import cv2
 import numpy as np
@@ -48,10 +79,19 @@ class SG_Nav_Agent():
         self.panoramic = []
         self.panoramic_depth = []
         self.turn_angles = 0
+        self.force_cpu = os.environ.get("SGNAV_FORCE_CPU", "0") not in [
+            "0",
+            "false",
+            "False",
+        ]
         self.device = (
-            torch.device("cuda:{}".format(0))
-            if torch.cuda.is_available()
-            else torch.device("cpu")
+            torch.device("cpu")
+            if self.force_cpu
+            else (
+                torch.device("cuda:{}".format(0))
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
         )
         self.prev_action = 0
         self.navigate_steps = 0
@@ -75,6 +115,9 @@ class SG_Nav_Agent():
         self.history_pose = []
         self.visualize_image_list = []
         self.count_episodes = -1
+        self._last_nav_step_log = -1
+        self._nav_progress_stream = None
+        self._nav_progress_line_active = False
         self.loop_time = 0
         self.last_segment_num = 0
         self.goal_merge_threshold = 0.8
@@ -107,7 +150,7 @@ class SG_Nav_Agent():
         glip_cfg.num_gpus = 1
         glip_cfg.merge_from_file(config_file) 
         glip_cfg.merge_from_list(["MODEL.WEIGHT", weight_file])
-        glip_cfg.merge_from_list(["MODEL.DEVICE", "cuda"])
+        glip_cfg.merge_from_list(["MODEL.DEVICE", "cpu" if self.force_cpu else "cuda"])
         self.glip_demo = GLIPDemo(
             glip_cfg,
             min_image_size=800,
@@ -271,6 +314,47 @@ class SG_Nav_Agent():
                     stuck_steps_threshold=int(getattr(self.args, "gnn_fallback_stuck_steps_threshold", 8)),
                 )
             )
+
+    def maybe_log_navigation_step(self):
+        if not bool(getattr(self.args, "show_nav_steps", False)):
+            return
+        interval = max(1, int(getattr(self.args, "nav_step_log_interval", 1)))
+        if self.total_steps != 1 and self.total_steps - self._last_nav_step_log < interval:
+            return
+        self._last_nav_step_log = int(self.total_steps)
+        total_episodes = getattr(self.args, "num_episodes", None)
+        if total_episodes is None:
+            episode_text = f"{self.count_episodes + 1:04d}"
+        else:
+            episode_text = f"{self.count_episodes + 1:04d}/{int(total_episodes):04d}"
+        line = (
+            f"\rNAV episode {episode_text} | "
+            f"step {self.total_steps:04d} | "
+            f"nav {self.navigate_steps:04d}"
+        )
+        stream = self.get_nav_progress_stream()
+        stream.write(line.ljust(72))
+        stream.flush()
+        self._nav_progress_line_active = True
+
+    def get_nav_progress_stream(self):
+        if self._nav_progress_stream is not None:
+            return self._nav_progress_stream
+        try:
+            self._nav_progress_stream = open("/dev/tty", "w", buffering=1)
+        except OSError:
+            self._nav_progress_stream = sys.stderr
+        return self._nav_progress_stream
+
+    def finish_nav_progress_line(self):
+        if not bool(getattr(self.args, "show_nav_steps", False)):
+            return
+        if not getattr(self, "_nav_progress_line_active", False):
+            return
+        stream = self.get_nav_progress_stream()
+        stream.write("\n")
+        stream.flush()
+        self._nav_progress_line_active = False
     
     def reset(self):
         self.navigate_steps = 0
@@ -291,6 +375,7 @@ class SG_Nav_Agent():
         self.former_collide = 0
         self.goal_gps = np.array([0.,0.])
         self.possible_goal_temp_gps = np.array([0.,0.])
+        self.current_gps = np.array([0.,0.], dtype=np.float32)
         self.last_gps = np.array([11100.,11100.])
         self.has_panarama = False
         self.init_map()
@@ -305,6 +390,8 @@ class SG_Nav_Agent():
         self.history_pose = []
         self.visualize_image_list = []
         self.count_episodes = self.count_episodes + 1
+        self._last_nav_step_log = -1
+        self._nav_progress_line_active = False
         self.loop_time = 0
         self.last_segment_num = 0
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
@@ -350,10 +437,17 @@ class SG_Nav_Agent():
         self.reperception_source = ""
         self.reperception_score_sum = 0.0
         self.reperception_steps = 0
+        self.reperception_approach_steps = 0
         self.reperception_observation_count = 0
         self.reperception_last_step = -1
         self.reperception_history = []
         self.rejected_goal_candidates = []
+        self.last_goal_observation_step = -1
+        self.last_goal_observation_gps = None
+        self.last_goal_observation_source = ""
+        self.last_goal_observation_confidence = 0.0
+        self.confirmed_goal_step = -1
+        self.final_goal_check_turns = 0
 
     def goal_gps_to_map_xy(self, goal_gps):
         """Return map pixel [x, y] in the same convention as SceneGraph node.center."""
@@ -376,6 +470,154 @@ class SG_Nav_Agent():
         except Exception:
             self.scenegraph.debug_stats.inc("reperception_confidence_fallback")
             return float(default)
+
+    def robust_depth_in_box(self, box, fallback_point=None, percentile=30.0):
+        box_np = box.detach().cpu().numpy() if torch.is_tensor(box) else np.asarray(box)
+        x0, y0, x1, y1 = [int(v) for v in box_np[:4]]
+        h, w = self.depth.shape[:2]
+        x0 = min(max(x0, 0), w - 1)
+        x1 = min(max(x1, x0 + 1), w)
+        y0 = min(max(y0, 0), h - 1)
+        y1 = min(max(y1, y0 + 1), h)
+
+        # Use the central crop of the detection box. Full boxes often include wall/floor
+        # pixels that move the projected goal behind the real object.
+        cx0 = x0 + int((x1 - x0) * 0.25)
+        cx1 = x0 + int((x1 - x0) * 0.75)
+        cy0 = y0 + int((y1 - y0) * 0.25)
+        cy1 = y0 + int((y1 - y0) * 0.75)
+        cx1 = max(cx1, cx0 + 1)
+        cy1 = max(cy1, cy0 + 1)
+        patch = self.depth[cy0:cy1, cx0:cx1, 0]
+        values = patch[np.isfinite(patch)]
+        values = values[(values > 0.05) & (values < 99.0)]
+        if len(values) > 0:
+            return float(np.percentile(values, percentile))
+        if fallback_point is None:
+            fallback_point = ((x0 + x1) // 2, (y0 + y1) // 2)
+        return float(self.depth[fallback_point[1], fallback_point[0], 0])
+
+    def robust_depth_in_mask(self, mask, fallback_point, percentile=30.0):
+        mask_np = np.asarray(mask).astype(bool)
+        if mask_np.shape[:2] == self.depth.shape[:2]:
+            values = self.depth[:, :, 0][mask_np]
+            values = values[np.isfinite(values)]
+            values = values[(values > 0.05) & (values < 99.0)]
+            if len(values) > 0:
+                return float(np.percentile(values, percentile))
+        return float(self.depth[fallback_point[1], fallback_point[0], 0])
+
+    def use_robust_goal_depth(self):
+        return bool(getattr(self.args, "use_robust_goal_depth", False))
+
+    def use_reperception_approach_gate(self):
+        return bool(getattr(self.args, "enable_reperception_approach_gate", False))
+
+    def depth_at_point(self, point):
+        x = int(point[0].item()) if torch.is_tensor(point[0]) else int(point[0])
+        y = int(point[1].item()) if torch.is_tensor(point[1]) else int(point[1])
+        return float(self.depth[y, x, 0])
+
+    def goal_depth_from_box(self, box, center_point):
+        if self.use_robust_goal_depth():
+            return self.robust_depth_in_box(
+                box,
+                fallback_point=(int(center_point[0].item()), int(center_point[1].item())),
+            )
+        return self.depth_at_point(center_point)
+
+    def goal_depth_from_mask(self, mask, center_point):
+        if self.use_robust_goal_depth():
+            return self.robust_depth_in_mask(
+                mask,
+                fallback_point=(int(center_point[0].item()), int(center_point[1].item())),
+            )
+        return self.depth_at_point(center_point)
+
+    def current_distance_to_goal_gps(self, goal_gps):
+        current_gps = getattr(self, "current_gps", None)
+        if current_gps is None:
+            return float("inf")
+        return float(np.linalg.norm(np.asarray(current_gps, dtype=np.float32) - np.asarray(goal_gps, dtype=np.float32)))
+
+    def reperception_goal_is_near(self, radius=None):
+        if self.reperception_goal_gps is None:
+            return False
+        if radius is None:
+            radius = float(getattr(self.args, "reperception_confirm_radius_m", 1.5))
+        return self.current_distance_to_goal_gps(self.reperception_goal_gps) <= float(radius)
+
+    def remember_goal_observation(self, goal_gps, confidence, source):
+        self.last_goal_observation_step = int(self.total_steps)
+        self.last_goal_observation_gps = np.asarray(goal_gps, dtype=np.float32).copy()
+        self.last_goal_observation_source = str(source)
+        self.last_goal_observation_confidence = float(confidence)
+
+    def goal_label_matches(self, label):
+        label = str(label).lower()
+        goal = str(self.obj_goal).lower()
+        goal_sg = str(self.obj_goal_sg).lower()
+        if goal in label or goal_sg in label:
+            return True
+        if goal == "gym_equipment" and any(x in label for x in ["treadmill", "exercise machine", "fitness equipment"]):
+            return True
+        if goal == "chest_of_drawers" and any(x in label for x in ["drawers", "chest of drawers"]):
+            return True
+        if goal == "tv_monitor" and any(x in label for x in ["tv", "monitor"]):
+            return True
+        return False
+
+    def detect_goal_visible_for_stop(self, observations):
+        try:
+            predictions = self.glip_demo.inference(observations["rgb"][:, :, [2, 1, 0]], object_captions)
+            labels = self.get_glip_real_label(predictions)
+            scores = predictions.get_field("scores")
+        except Exception as exc:
+            self.handle_gnn_logging_error(exc, "final_goal_visible_check")
+            return False
+
+        min_conf = float(getattr(self.args, "final_goal_min_confidence", 0.45))
+        max_depth = float(getattr(self.args, "final_goal_visible_distance_m", self.distance_threshold))
+        for idx, label in enumerate(labels):
+            if not self.goal_label_matches(label):
+                continue
+            confidence = self.confidence_to_float(scores[idx], default=0.0)
+            if confidence < min_conf:
+                continue
+            box = predictions.bbox[idx].to(torch.int64)
+            center_point = (box[:2] + box[2:]) // 2
+            temp_direction = (center_point[0] - 320) * 79 / 640
+            temp_distance = self.goal_depth_from_box(box, center_point)
+            if temp_distance >= max_depth:
+                continue
+            goal_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
+            self.remember_goal_observation(goal_gps, confidence, "final_stop_glip_bbox")
+            return True
+        return False
+
+    def handle_final_goal_stop_check(self, observations):
+        if (
+            not bool(getattr(self.args, "enable_final_goal_check", False))
+            or bool(getattr(self.args, "disable_final_goal_check", False))
+        ):
+            return None
+        max_age = max(0, int(getattr(self.args, "final_goal_visible_max_age", 3)))
+        if self.last_goal_observation_step >= 0 and self.total_steps - self.last_goal_observation_step <= max_age:
+            self.final_goal_check_turns = 0
+            return None
+        if self.detect_goal_visible_for_stop(observations):
+            self.final_goal_check_turns = 0
+            return None
+
+        max_turns = max(0, int(getattr(self.args, "final_goal_check_steps", 6)))
+        if self.final_goal_check_turns < max_turns:
+            self.final_goal_check_turns += 1
+            self.scenegraph.debug_stats.inc("final_goal_visibility_check_turn")
+            return 3
+
+        self.scenegraph.debug_stats.inc("final_goal_visibility_rejected")
+        self.reject_reperception_goal(reason="final_goal_not_visible")
+        return 3
 
     def mark_goal_candidate_map(self, goal_gps):
         goal_xy = self.goal_gps_to_map_xy(goal_gps)
@@ -552,6 +794,8 @@ class SG_Nav_Agent():
         self.found_goal = True
         self.found_possible_goal = False
         self.found_goal_times = self.reperception_score_sum
+        self.confirmed_goal_step = int(self.total_steps)
+        self.final_goal_check_turns = 0
         self.reperception_active = False
         self.scenegraph.debug_stats.inc("reperception_confirmed")
 
@@ -572,7 +816,9 @@ class SG_Nav_Agent():
         self.reperception_source = ""
         self.reperception_score_sum = 0.0
         self.reperception_steps = 0
+        self.reperception_approach_steps = 0
         self.reperception_observation_count = 0
+        self.final_goal_check_turns = 0
         self.scenegraph.debug_stats.inc("reperception_rejected")
         
     def detect_objects(self, observations):
@@ -739,6 +985,7 @@ class SG_Nav_Agent():
             return {"action": 0}
         
         self.total_steps += 1
+        self.maybe_log_navigation_step()
         if self.navigate_steps == 0:
             self.prob_array_room = self.co_occur_room_mtx[self.goal_idx[self.obj_goal]]
             self.prob_array_obj = self.co_occur_mtx[self.goal_idx[self.obj_goal]]
@@ -747,6 +994,7 @@ class SG_Nav_Agent():
         self.depth = observations["depth"]
         self.rgb = observations["rgb"][:,:,[2,1,0]]
         self.rgb_visualization = observations["rgb"]
+        self.current_gps = np.asarray(observations["gps"], dtype=np.float32).copy()
 
         self.scenegraph.set_agent(self)
         self.scenegraph.set_navigate_steps(self.navigate_steps)
@@ -877,7 +1125,12 @@ class SG_Nav_Agent():
         
         if number_action == 0:
             if self.found_goal:
-                self.stop_reason = 'planner_stop_after_found_goal'
+                final_check_action = self.handle_final_goal_stop_check(observations)
+                if final_check_action is None:
+                    self.stop_reason = 'planner_stop_after_found_goal'
+                else:
+                    number_action = final_check_action
+                    self.stop_reason = 'final_goal_visibility_check'
             else:
                 self.stop_reason = 'planner_stop_without_confirmed_goal'
         else:
@@ -1244,15 +1497,20 @@ class SG_Nav_Agent():
         fmm_dist = planner.fmm_dist[::-1]
         fmm_dist_m = fmm_dist[1:-1, 1:-1] / 20.0
 
-        if bool(getattr(self.args, "use_gnn_nav", False)) and not bool(getattr(self.args, "collect_gnn_data", False)):
+        gnn_goal = None
+        if bool(getattr(self.args, "use_gnn_nav", False)):
             gnn_goal = self.fbe_gnn(
                 traversible=traversible,
                 start=start,
                 frontier_map=frontier_map,
                 fmm_dist_m=fmm_dist_m,
             )
-            if gnn_goal is not None:
-                return gnn_goal
+            if not bool(getattr(self.args, "collect_gnn_data", False)):
+                if gnn_goal is not None:
+                    self.gnn_last_frontier_selection_source = "gnn_nav"
+                    return gnn_goal
+                self.gnn_last_frontier_selection_source = "gnn_nav_unavailable"
+                return None
 
         frontier_locations += 1
         frontier_locations = frontier_locations.cpu().numpy()
@@ -1275,14 +1533,7 @@ class SG_Nav_Agent():
         selected_valid_idx = int(np.argmax(scores))
         idx_16_max = idx_16[0][selected_valid_idx]
         goal = frontier_locations[idx_16_max] - 1
-        gnn_goal = None
         if bool(getattr(self.args, "use_gnn_nav", False)):
-            gnn_goal = self.fbe_gnn(
-                traversible=traversible,
-                start=start,
-                frontier_map=frontier_map,
-                fmm_dist_m=fmm_dist_m,
-            )
             if gnn_goal is not None:
                 goal = np.asarray(gnn_goal, dtype=np.int64).reshape(-1)[:2]
                 selected_valid_idx = int(
@@ -1291,6 +1542,8 @@ class SG_Nav_Agent():
                     )
                 )
                 idx_16_max = int(idx_16[0][selected_valid_idx])
+            else:
+                self.gnn_last_frontier_selection_source = "gnn_nav_unavailable"
         if bool(getattr(self.args, "collect_gnn_data", False)):
             self.log_gnn_raw_sample(
                 frontier_map=frontier_map,
@@ -1308,8 +1561,11 @@ class SG_Nav_Agent():
                 selected_goal_rc=goal,
             )
         if gnn_goal is not None:
+            self.gnn_last_frontier_selection_source = "gnn_nav"
             self.scores = scores
             return goal
+        if bool(getattr(self.args, "use_gnn_nav", False)):
+            return None
         if (
             bool(getattr(self.args, "gnn_log", False))
             and self.gnn_graph_builder is not None
@@ -1589,6 +1845,7 @@ class SG_Nav_Agent():
     def log_episode_result(self, metrics):
         if getattr(self, "episode_logged", False):
             return
+        self.finish_nav_progress_line()
         debug_logger_enabled = bool(getattr(self.episode_logger, "enabled", False))
         summary_logger_enabled = bool(getattr(getattr(self, "gnn_episode_summary_logger", None), "enabled", False))
         if not debug_logger_enabled and not summary_logger_enabled:
@@ -1619,10 +1876,16 @@ class SG_Nav_Agent():
             "found_possible_goal": bool(self.found_possible_goal),
             "reperception_active": bool(self.reperception_active),
             "reperception_steps": int(self.reperception_steps),
+            "reperception_approach_steps": int(self.reperception_approach_steps),
             "reperception_observation_count": int(self.reperception_observation_count),
             "reperception_min_observations": int(self.reperception_min_observations),
             "reperception_threshold": float(self.reperception_threshold),
             "reperception_score_sum": float(self.reperception_score_sum),
+            "reperception_confirm_radius_m": float(getattr(self.args, "reperception_confirm_radius_m", 1.5)),
+            "last_goal_observation_step": int(self.last_goal_observation_step),
+            "last_goal_observation_source": self.last_goal_observation_source,
+            "last_goal_observation_confidence": float(self.last_goal_observation_confidence),
+            "final_goal_check_turns": int(self.final_goal_check_turns),
             "found_goal_stop_distance_m": float(self.found_goal_stop_distance_m),
             "reperception_rejected_count": len(self.rejected_goal_candidates),
             "reperception_history": self.reperception_history[-10:],
@@ -1770,6 +2033,12 @@ def main():
         "--reperception_max_steps", default=10, type=int
     )
     parser.add_argument(
+        "--reperception_confirm_radius_m", default=1.5, type=float
+    )
+    parser.add_argument(
+        "--reperception_approach_max_steps", default=80, type=int
+    )
+    parser.add_argument(
         "--reperception_min_dist_m", default=0.25, type=float
     )
     parser.add_argument(
@@ -1783,6 +2052,30 @@ def main():
     )
     parser.add_argument(
         "--found_goal_stop_distance_m", default=0.35, type=float
+    )
+    parser.add_argument(
+        "--use_robust_goal_depth", action="store_true"
+    )
+    parser.add_argument(
+        "--enable_reperception_approach_gate", action="store_true"
+    )
+    parser.add_argument(
+        "--enable_final_goal_check", action="store_true"
+    )
+    parser.add_argument(
+        "--disable_final_goal_check", action="store_true"
+    )
+    parser.add_argument(
+        "--final_goal_visible_max_age", default=3, type=int
+    )
+    parser.add_argument(
+        "--final_goal_check_steps", default=6, type=int
+    )
+    parser.add_argument(
+        "--final_goal_min_confidence", default=0.45, type=float
+    )
+    parser.add_argument(
+        "--final_goal_visible_distance_m", default=5.0, type=float
     )
     parser.add_argument(
         "--use_gnn_nav", action="store_true"
@@ -1887,7 +2180,16 @@ def main():
         "--gnn_keyframe_update_k", default=5, type=int
     )
     parser.add_argument(
+        "--gnn_enable_scenegraph_metadata", action="store_true"
+    )
+    parser.add_argument(
         "--debug_gnn", action="store_true"
+    )
+    parser.add_argument(
+        "--show_nav_steps", action="store_true"
+    )
+    parser.add_argument(
+        "--nav_step_log_interval", default=1, type=int
     )
     args = parser.parse_args()
     os.environ["CHALLENGE_CONFIG_FILE"] = args.config
