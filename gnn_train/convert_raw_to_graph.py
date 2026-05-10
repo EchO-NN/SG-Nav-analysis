@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--strict_label_aggregation", action="store_true")
     parser.add_argument("--forbid_distance_label_fallback", action="store_true")
     parser.add_argument("--allow_point_frontiers_debug", action="store_true")
+    parser.add_argument("--allow_debug_fallbacks", action="store_true")
     parser.add_argument("--write_conversion_report", nargs="?", const="conversion_report.json", default=None)
     args = parser.parse_args()
 
@@ -73,10 +74,12 @@ def main():
                 skipped += 1
                 skip_reason_counts["samples_skipped_empty_frontiers"] += 1
                 continue
-        except Exception:
+        except Exception as exc:
             if args.skip_errors:
                 skipped += 1
-                skip_reason_counts["samples_skipped_error"] += 1
+                reason = str(exc) or type(exc).__name__
+                reason = reason.splitlines()[0][:160]
+                skip_reason_counts[f"samples_skipped_{reason}"] += 1
                 continue
             raise
         conversion_report = graph_sample.get("conversion_report", {})
@@ -111,6 +114,14 @@ def main():
         "forbid_distance_label_fallback": bool(args.forbid_distance_label_fallback),
         "allow_point_frontiers_debug": bool(args.allow_point_frontiers_debug),
     }
+    for key in [
+        "cluster_extraction_error_count",
+        "cluster_fallback_to_points_count",
+        "cluster_label_missing_count",
+        "distance_only_label_count",
+    ]:
+        report["report_counts"].setdefault(key, 0)
+
     print(f"converted {count} samples -> {args.output_dir}")
     if skipped:
         print(f"skipped {skipped} samples")
@@ -122,6 +133,21 @@ def main():
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
         print(f"wrote conversion report: {report_path}")
+
+    if not args.allow_debug_fallbacks and (
+        args.strict_frontier_clusters or args.strict_label_aggregation or args.forbid_distance_label_fallback
+    ):
+        bad_counts = {
+            key: int(report["report_counts"].get(key, 0))
+            for key in [
+                "cluster_fallback_to_points_count",
+                "distance_only_label_count",
+                "cluster_label_missing_count",
+            ]
+        }
+        bad_counts = {key: value for key, value in bad_counts.items() if value > 0}
+        if bad_counts:
+            raise RuntimeError(f"strict conversion produced forbidden fallbacks: {bad_counts}")
 
 
 if __name__ == "__main__":

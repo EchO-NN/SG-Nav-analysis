@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,23 @@ def _safe_ratio(chosen, best):
     return float(np.mean(chosen[valid] / (best[valid] + 1e-6)))
 
 
+def distance_baseline_idx(sample):
+    frontier = sample.get("frontier", {})
+    distance_scores = frontier.get("distance_inverse")
+    if distance_scores is not None:
+        distance_scores = torch.as_tensor(distance_scores, dtype=torch.float32).reshape(-1)
+        if distance_scores.numel() > 0:
+            return int(torch.argmax(distance_scores).item())
+
+    graph = sample.get("graph")
+    if graph is not None and "frontier" in graph.node_features:
+        frontier_features = graph.node_features["frontier"]
+        # SparseDecisionGraphBuilder stores distance_inverse at frontier feature index 4.
+        if frontier_features.ndim == 2 and frontier_features.shape[0] > 0 and frontier_features.shape[1] > 4:
+            return int(torch.argmax(frontier_features[:, 4]).item())
+    return 0
+
+
 def _metric_dict(records):
     if len(records) == 0:
         return {
@@ -36,23 +54,25 @@ def _metric_dict(records):
             "rank_loss": 0.0,
             "top1": 0.0,
             "top3": 0.0,
-            "pred_oracle_top1": 0.0,
-            "pred_oracle_top3": 0.0,
+            "pred_label_top1": 0.0,
+            "pred_label_top3": 0.0,
             "chosen_cost": 0.0,
             "best_cost": 0.0,
             "cost_ratio": 0.0,
             "pred_cost_ratio": 0.0,
             "pred_teacher_agreement": 0.0,
-            "teacher_oracle_agreement": 0.0,
+            "teacher_label_agreement": 0.0,
             "teacher_cost_ratio": 0.0,
             "distance_cost_ratio": 0.0,
             "random_cost_ratio": 0.0,
             "num_frontiers_mean": 0.0,
             "num_objects_mean": 0.0,
+            "label_type_counts": {},
             "count": 0,
         }
     chosen = [r["chosen_cost"] for r in records]
     best = [r["best_cost"] for r in records]
+    label_type_counts = Counter(str(r.get("label_type", "missing")) for r in records)
     return {
         "loss": float(np.mean([r["loss"] for r in records])),
         "frontier_loss": float(np.mean([r["frontier_loss"] for r in records])),
@@ -60,8 +80,8 @@ def _metric_dict(records):
         "rank_loss": float(np.mean([r["rank_loss"] for r in records])),
         "top1": float(np.mean([r["top1"] for r in records])),
         "top3": float(np.mean([r["top3"] for r in records])),
-        "pred_oracle_top1": float(np.mean([r["pred_oracle_top1"] for r in records])),
-        "pred_oracle_top3": float(np.mean([r["pred_oracle_top3"] for r in records])),
+        "pred_label_top1": float(np.mean([r["pred_label_top1"] for r in records])),
+        "pred_label_top3": float(np.mean([r["pred_label_top3"] for r in records])),
         "chosen_cost": float(np.mean(chosen)),
         "best_cost": float(np.mean(best)),
         "cost_ratio": _safe_ratio(chosen, best),
@@ -69,8 +89,8 @@ def _metric_dict(records):
         "pred_teacher_agreement": float(np.mean([r["pred_teacher_agreement"] for r in records if r["pred_teacher_agreement"] >= 0]))
         if any(r["pred_teacher_agreement"] >= 0 for r in records)
         else 0.0,
-        "teacher_oracle_agreement": float(np.mean([r["teacher_oracle_agreement"] for r in records if r["teacher_oracle_agreement"] >= 0]))
-        if any(r["teacher_oracle_agreement"] >= 0 for r in records)
+        "teacher_label_agreement": float(np.mean([r["teacher_label_agreement"] for r in records if r["teacher_label_agreement"] >= 0]))
+        if any(r["teacher_label_agreement"] >= 0 for r in records)
         else 0.0,
         "teacher_cost_ratio": _safe_ratio(
             [r["teacher_chosen_cost"] for r in records if np.isfinite(r["teacher_chosen_cost"])],
@@ -80,6 +100,7 @@ def _metric_dict(records):
         "random_cost_ratio": _safe_ratio([r["random_chosen_cost"] for r in records], best),
         "num_frontiers_mean": float(np.mean([r["num_frontiers"] for r in records])),
         "num_objects_mean": float(np.mean([r["num_objects"] for r in records])),
+        "label_type_counts": dict(label_type_counts),
         "count": len(records),
     }
 
@@ -101,12 +122,13 @@ def _record_from_logits(sample, logits, loss, frontier_loss, teacher_loss, rank_
     teacher_chosen_cost = float("nan")
     if 0 <= teacher_best < finite_costs.numel():
         teacher_chosen_cost = float(finite_costs[teacher_best].detach().cpu().item())
-    distance_scores = sample.get("frontier", {}).get("distance_inverse")
-    if distance_scores is not None and len(distance_scores) == finite_costs.numel():
-        distance_idx = int(torch.argmax(torch.as_tensor(distance_scores)).item())
-    else:
+    distance_idx = distance_baseline_idx(sample)
+    if distance_idx >= finite_costs.numel():
         distance_idx = 0
-    random_idx = 0
+    finite_random = finite_costs[torch.isfinite(finite_costs)]
+    random_expected_cost = (
+        float(finite_random.mean().detach().cpu().item()) if finite_random.numel() else float("nan")
+    )
     return {
         "loss": float(loss.detach().cpu().item()),
         "frontier_loss": float(frontier_loss.detach().cpu().item()),
@@ -114,17 +136,18 @@ def _record_from_logits(sample, logits, loss, frontier_loss, teacher_loss, rank_
         "rank_loss": float(rank_loss.detach().cpu().item()),
         "top1": float(pred == best_idx),
         "top3": float(top3),
-        "pred_oracle_top1": float(pred == best_idx),
-        "pred_oracle_top3": float(top3),
+        "pred_label_top1": float(pred == best_idx),
+        "pred_label_top3": float(top3),
         "chosen_cost": chosen_cost,
         "best_cost": best_cost,
         "pred_teacher_agreement": float(pred == teacher_best) if teacher_best >= 0 else -1.0,
-        "teacher_oracle_agreement": float(teacher_best == best_idx) if teacher_best >= 0 else -1.0,
+        "teacher_label_agreement": float(teacher_best == best_idx) if teacher_best >= 0 else -1.0,
         "teacher_chosen_cost": teacher_chosen_cost,
         "distance_chosen_cost": float(finite_costs[distance_idx].detach().cpu().item()) if finite_costs.numel() else float("nan"),
-        "random_chosen_cost": float(finite_costs[random_idx].detach().cpu().item()) if finite_costs.numel() else float("nan"),
+        "random_chosen_cost": random_expected_cost,
         "num_frontiers": int(logits.numel()),
         "num_objects": int(sample["graph"].node_features.get("object").shape[0]),
+        "label_type": str(labels.get("label_type", "missing")),
     }
 
 
@@ -206,11 +229,11 @@ def _format_metrics(prefix, metrics):
         "rank_loss",
         "top1",
         "top3",
-        "pred_oracle_top1",
-        "pred_oracle_top3",
+        "pred_label_top1",
+        "pred_label_top3",
         "pred_cost_ratio",
         "pred_teacher_agreement",
-        "teacher_oracle_agreement",
+        "teacher_label_agreement",
         "teacher_cost_ratio",
         "distance_cost_ratio",
         "random_cost_ratio",
@@ -218,7 +241,13 @@ def _format_metrics(prefix, metrics):
         "num_objects_mean",
         "count",
     ]
-    return " ".join(f"{prefix}_{key}={metrics[key]:.4f}" if key != "count" else f"{prefix}_count={metrics[key]}" for key in keys)
+    text = " ".join(
+        f"{prefix}_{key}={metrics[key]:.4f}" if key != "count" else f"{prefix}_count={metrics[key]}"
+        for key in keys
+    )
+    if metrics.get("label_type_counts"):
+        text += f" {prefix}_label_type_counts={json.dumps(metrics['label_type_counts'], ensure_ascii=False)}"
+    return text
 
 
 def main():

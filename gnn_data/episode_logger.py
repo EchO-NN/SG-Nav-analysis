@@ -28,6 +28,18 @@ def _map_array(value, dtype=np.float16):
     return arr.astype(dtype)
 
 
+def _config_value(config, dotted_path: str, default="unknown"):
+    obj = config
+    for part in dotted_path.split("."):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            obj = obj.get(part, default)
+        else:
+            obj = getattr(obj, part, default)
+    return default if obj is None else obj
+
+
 def _goal_xy_to_rc(goal_xy):
     arr = _np(goal_xy, dtype=np.float32)
     if arr is None or arr.size < 2 or not np.isfinite(arr.reshape(-1)[:2]).all():
@@ -76,6 +88,21 @@ def _found_goal_payload(agent, metrics: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _rejected_candidate_rcs(agent, rejected):
+    out = []
+    for item in rejected:
+        gps = item.get("gps") if isinstance(item, dict) else None
+        if gps is None or not hasattr(agent, "goal_gps_to_map_xy"):
+            continue
+        try:
+            rc = _goal_xy_to_rc(agent.goal_gps_to_map_xy(gps))
+        except Exception:
+            rc = None
+        if rc is not None:
+            out.append(rc)
+    return out
+
+
 def _trajectory(agent):
     out = []
     for step_id, pose in enumerate(getattr(agent, "history_pose", []) or []):
@@ -104,9 +131,7 @@ class EpisodeSummaryLogger:
         episode = getattr(env, "current_episode", None)
         metadata = {
             "dataset": "mp3d",
-            "split": str(getattr(getattr(agent, "config", None), "DATASET", {}).get("SPLIT", "unknown"))
-            if isinstance(getattr(getattr(agent, "config", None), "DATASET", None), dict)
-            else str(getattr(getattr(getattr(agent, "config", None), "DATASET", None), "SPLIT", "unknown")),
+            "split": str(_config_value(getattr(agent, "config", None), "DATASET.SPLIT", "unknown")),
             "scene_id": getattr(episode, "scene_id", "unknown_scene"),
             "episode_id": str(getattr(episode, "episode_id", "unknown_episode")),
             "goal_text": str(getattr(agent, "obj_goal_sg", getattr(agent, "obj_goal", ""))),
@@ -125,36 +150,75 @@ class EpisodeSummaryLogger:
         )
         discovered_objects = []
         rejected = getattr(agent, "rejected_goal_candidates", []) or []
+        rejected_rcs = _rejected_candidate_rcs(agent, rejected)
+        rejected_radius_px = (
+            float(getattr(agent, "rejected_goal_radius_m", 0.8)) * 100.0 / max(float(getattr(agent, "map_resolution", 5.0)), 1e-6)
+        )
         for obj in scenegraph.get("objects", []):
             item = dict(obj)
             last_seen = item.get("last_seen_step")
             first_seen = item.get("first_seen_step", last_seen if last_seen is not None else 0)
             item["first_seen_step"] = int(first_seen if first_seen is not None else 0)
             item["last_seen_step"] = int(last_seen if last_seen is not None else item["first_seen_step"])
-            item["stable"] = int(item.get("observed_count", 1)) >= 3
-            item["rejected_candidate"] = False
+            lifetime = max(0, item["last_seen_step"] - item["first_seen_step"])
+            item["lifetime_steps"] = int(lifetime)
+            item["stable"] = int(item.get("observed_count", 1)) >= 3 or lifetime >= 5
+            center_rc = _np(item.get("center_rc"), dtype=np.float32)
+            if center_rc is not None and center_rc.size >= 2 and rejected_rcs:
+                center_rc = center_rc.reshape(-1)[:2]
+                item["rejected_candidate"] = any(
+                    np.linalg.norm(center_rc - rejected_rc.reshape(-1)[:2]) <= rejected_radius_px
+                    for rejected_rc in rejected_rcs
+                )
+            else:
+                item["rejected_candidate"] = False
             item["source_node_id"] = item.get("node_id")
             discovered_objects.append(item)
+
+        fallback_records = list(getattr(agent, "gnn_fallback_records", []) or [])
+
+        target_goal = _found_goal_payload(agent, metrics)
+        final_maps = {
+            "full_map": _map_array(getattr(agent, "full_map", None)),
+            "free_map": _map_array(getattr(agent, "fbe_free_map", None)),
+            "room_map": _map_array(getattr(agent, "room_map", None)),
+        }
+        trajectory = _trajectory(agent)
+        fallback = {
+            "num_fallback_calls": len(fallback_records),
+            "fallback_records": fallback_records,
+        }
+        debug = {
+            "rejected_goal_candidates": rejected,
+            "reperception_history": getattr(agent, "reperception_history", [])[-20:],
+            "raw_samples_saved": int(getattr(agent, "gnn_raw_samples_saved", 0)),
+            "raw_samples_failed": int(getattr(agent, "gnn_raw_samples_failed", 0)),
+            "replay_samples_saved": int(getattr(agent, "gnn_replay_samples_saved", 0)),
+            "replay_samples_failed": int(getattr(agent, "gnn_replay_samples_failed", 0)),
+        }
 
         return {
             "version": EPISODE_SUMMARY_VERSION,
             "metadata": metadata,
-            "target_goal": _found_goal_payload(agent, metrics),
-            "final_maps": {
-                "full_map": _map_array(getattr(agent, "full_map", None)),
-                "free_map": _map_array(getattr(agent, "fbe_free_map", None)),
-                "room_map": _map_array(getattr(agent, "room_map", None)),
-            },
-            "trajectory": _trajectory(agent),
+            "target_goal": target_goal,
+            "final_maps": final_maps,
+            "trajectory": trajectory,
             "discovered_objects": discovered_objects,
-            "fallback": {
-                "num_fallback_calls": 0,
-                "fallback_records": [],
-            },
-            "debug": {
-                "rejected_goal_candidates": rejected,
-                "reperception_history": getattr(agent, "reperception_history", [])[-20:],
-            },
+            "fallback": fallback,
+            "debug": debug,
+
+            # Flat compatibility keys for downstream hindsight scripts.
+            "episode_id": metadata["episode_id"],
+            "scene_id": metadata["scene_id"],
+            "success": metadata["success"],
+            "target_goal_text": metadata["goal_text"],
+            "found_goal_rc": target_goal["found_goal_rc"],
+            "found_goal_world": target_goal["found_goal_world"],
+            "final_full_map": final_maps["full_map"],
+            "final_free_map": final_maps["free_map"],
+            "final_room_map": final_maps["room_map"],
+            "rejected_candidates": rejected,
+            "fallback_queries": fallback_records,
         }
 
     def save_episode(self, agent, metrics: Dict[str, Any]) -> Optional[str]:

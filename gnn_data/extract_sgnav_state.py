@@ -352,7 +352,8 @@ def build_raw_sgnav_step_sample(
                 "frontier_locations_valid_rc": tuple(frontier_locations_valid_rc.shape),
                 "scenegraph_scores": tuple(scenegraph_scores.shape),
                 "total_scores": tuple(total_scores.shape),
-            }
+            },
+            "gnn_fallback": getattr(agent, "current_gnn_fallback_record", None),
         },
     }
 

@@ -44,9 +44,13 @@ class GNNFrontierScorer:
         cur_start=None,
         current_step: int = 0,
         candidate_goals=None,
-    ) -> np.ndarray:
+        return_graph_info: bool = False,
+    ):
         if len(frontier_clusters) == 0:
-            return np.zeros((0,), dtype=np.float32)
+            scores = np.zeros((0,), dtype=np.float32)
+            if return_graph_info:
+                return scores, {"num_object_nodes": 0, "num_frontiers": 0}
+            return scores
 
         graph = self.builder.build(
             scenegraph=scenegraph,
@@ -61,16 +65,24 @@ class GNNFrontierScorer:
             current_step=current_step,
             candidate_goals=candidate_goals,
         )
+        graph_info = dict(getattr(graph, "metadata", {}) or {})
 
         if self.model is None:
             if self.fallback_to_distance:
-                return np.asarray([c.distance_inverse for c in frontier_clusters], dtype=np.float32)
-            return np.zeros((len(frontier_clusters),), dtype=np.float32)
+                scores = np.asarray([c.distance_inverse for c in frontier_clusters], dtype=np.float32)
+            else:
+                scores = np.zeros((len(frontier_clusters),), dtype=np.float32)
+            if return_graph_info:
+                return scores, graph_info
+            return scores
 
         graph = graph.to(self.device)
         out = self.model(graph)
         logits = out["frontier_logits"].detach().cpu().numpy()
-        return logits.astype(np.float32)
+        scores = logits.astype(np.float32)
+        if return_graph_info:
+            return scores, graph_info
+        return scores
 
 
 if __name__ == "__main__":

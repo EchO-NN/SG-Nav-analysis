@@ -49,6 +49,7 @@ python scripts/sample_objectnav_split.py \
   --gnn_collect_every_k_fbe 1 \
   --gnn_save_maps \
   --gnn_data_tag sgnav_teacher_s0_e2 \
+  --gnn_strict_logging \
   --num_episodes 100 \
   --shuffle_scenes
 ```
@@ -70,6 +71,10 @@ python scripts/sample_objectnav_split.py \
 ```bash
 python -m gnn_data.inspect_raw_sample \
   --path data/gnn_raw/mp3d/train/某个样本.pt
+
+python -m gnn_data.inspect_episode_summary \
+  --path data/gnn_episode_summary/mp3d/train/某个summary.pt \
+  --strict
 ```
 
 ### 3. 生成标签
@@ -87,6 +92,7 @@ python -m gnn_data.inspect_raw_sample \
   --gnn_collect_every_k_fbe 1 \
   --gnn_save_maps \
   --gnn_data_tag train50_sgnav \
+  --gnn_strict_logging \
   --num_episodes 100 \
   --split_l 0 \
   --split_r 50 \
@@ -96,12 +102,16 @@ python -m gnn_data.inspect_raw_sample \
 然后用成功 episode 的 final map 和确认目标位置生成严格 hindsight 标签：
 
 ```bash
-python -m gnn_data.hindsight_relabel \
-  --raw_step_dir data/gnn_raw/mp3d/train50 \
+python -m gnn_data.label_frontiers \
+  --input_dir data/gnn_raw/mp3d/train50 \
   --episode_summary_dir data/gnn_episode_summary/mp3d/train50 \
   --output_dir data/gnn_labeled_hindsight/mp3d/train50 \
-  --label_mode hindsight_goal_strict \
+  --label_mode final_map_hindsight_strict \
   --strict_labels \
+  --forbid_teacher_fallback \
+  --forbid_approx_fallback \
+  --require_hindsight_or_oracle \
+  --min_label_frontiers 2 \
   --skip_unlabeled \
   --tau 2.0 \
   --lambda_goal 1.0 \
@@ -142,10 +152,22 @@ python -m gnn_data.label_frontiers \
 
 ```bash
 python -m gnn_data.label_frontiers \
-  --input_dir data/gnn_raw/mp3d/train \
-  --output_dir data/gnn_labeled_all_objects/mp3d/train \
-  --label_mode hindsight_all_objects \
-  --pseudo_goal_min_confidence 0.5
+  --input_dir data/gnn_raw/mp3d/train50 \
+  --output_dir data/gnn_labeled_all_objects/mp3d/train50 \
+  --episode_summary_dir data/gnn_episode_summary/mp3d/train50 \
+  --label_mode hindsight_all_objects_strict \
+  --strict_labels \
+  --forbid_teacher_fallback \
+  --forbid_approx_fallback \
+  --require_hindsight_or_oracle \
+  --pseudo_goal_min_confidence 0.7 \
+  --pseudo_goal_min_observed_count 2 \
+  --pseudo_goal_min_lifetime_steps 5 \
+  --pseudo_goal_max_per_category 5 \
+  --pseudo_goal_exclude_unknown \
+  --pseudo_goal_exclude_rejected_candidates \
+  --skip_unlabeled \
+  --write_label_report
 ```
 
 只做 teacher sanity check：
@@ -185,9 +207,18 @@ python -m gnn_train.convert_raw_to_graph \
   --input_dir data/gnn_labeled/mp3d/train \
   --output_dir data/gnn_graph/mp3d/train \
   --max_frontier_clusters 32 \
+  --strict_frontier_clusters \
   --strict_label_aggregation \
   --forbid_distance_label_fallback \
   --write_conversion_report
+```
+
+检查转换报告：
+
+```bash
+python -m gnn_train.analyze_conversion_report \
+  --path data/gnn_graph/mp3d/train/conversion_report.json \
+  --strict
 ```
 
 ### 5. 训练 Frontier GNN
@@ -219,6 +250,17 @@ python -m gnn_train.eval_offline \
 ```
 
 会同时报告 random、distance、teacher 和 GNN 的 top1、top3、chosen_cost、best_cost、cost_ratio。
+重点看 `summary.pred_label_top1`、`summary.pred_label_top3`、`summary.cost_ratio`、
+`summary.random_cost_ratio`、`summary.distance_cost_ratio`、`summary.teacher_cost_ratio`、
+`summary.pred_teacher_agreement` 和 `summary.teacher_label_agreement`。
+
+训练后也可以检查 `metrics.jsonl`：
+
+```bash
+python -m gnn_train.analyze_training_metrics \
+  --path checkpoints/frontier_gnn_oracle_v1/metrics.jsonl \
+  --split val
+```
 
 检查 scene-disjoint split：
 
@@ -235,6 +277,13 @@ python -m gnn_data.check_scene_splits \
 python -m gnn_data.visualize_raw_sample \
   --path data/gnn_raw/mp3d/train/某个样本.pt \
   --output data/gnn_vis/raw_sample.png
+```
+
+```bash
+python -m gnn_data.visualize_hindsight_label \
+  --labeled_dir data/gnn_labeled_hindsight/mp3d/train50 \
+  --save_dir data/gnn_vis/hindsight_train50 \
+  --num_samples 20
 ```
 
 ```bash
@@ -354,6 +403,34 @@ checkpoints/gnn_nav/frontier_v1/gnn_scorer.pt
 - 加载训练好的 GNN checkpoint。
 - 输出每个 frontier 的 GNN 分数。
 - 根据 GNN 分数选择下一个 frontier。
+
+带不确定性 fallback 的在线测试：
+
+```bash
+./run_sg_nav.sh \
+  --use_gnn_nav \
+  --gnn_ckpt checkpoints/gnn_nav/frontier_v1/gnn_scorer.pt \
+  --gnn_use_fallback \
+  --gnn_fallback_mode sgnav_score \
+  --gnn_fallback_alpha 1.0 \
+  --gnn_fallback_max_prob_threshold 0.45 \
+  --gnn_fallback_margin_threshold 0.10 \
+  --gnn_fallback_entropy_threshold 1.50 \
+  --gnn_fallback_min_object_nodes 1 \
+  --gnn_log_fallback \
+  --debug_gnn
+```
+
+`--gnn_log_fallback` 会把 fallback 触发原因、GNN 分数、fallback 分数和最终选择写入 replay 样本 debug 字段，并汇总到 episode summary 的 `fallback.fallback_records`。
+如果需要低延迟稀疏模式，可显式加 `--disable_llm_edges` 或 `--sparse_graph_only`，此时 scenegraph 不再调用在线 LLM/VLM 关系边生成，object memory 和地图仍会更新。
+`--sparse_graph_only --gnn_keyframe_update_k 5` 会把昂贵的目标检测/物体记忆更新降到每 5 个导航步一次；疑似目标或卡住时会强制更新。
+
+分析 fallback 触发率：
+
+```bash
+python -m gnn_nav.analyze_fallback_log \
+  --dir data/gnn_episode_summary/mp3d/train50
+```
 
 ## 推荐流程
 

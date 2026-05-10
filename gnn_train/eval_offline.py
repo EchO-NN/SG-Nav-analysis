@@ -1,5 +1,6 @@
 import argparse
 import os
+from collections import Counter
 
 import numpy as np
 import torch
@@ -9,18 +10,20 @@ from gnn_train.dataset import FrontierGraphDataset, collate_single
 from gnn_train.model import GoalConditionedGraphNet
 
 
-def _distance_scores(sample):
+def distance_baseline_idx(sample):
     frontier = sample.get("frontier", {})
     inv = frontier.get("distance_inverse")
     if inv is not None:
         if hasattr(inv, "detach"):
             inv = inv.detach().cpu().numpy()
-        return np.asarray(inv, dtype=np.float32).reshape(-1)
+        scores = np.asarray(inv, dtype=np.float32).reshape(-1)
+        if scores.size > 0:
+            return int(np.argmax(scores))
     graph = sample["graph"]
     x = graph.node_features["frontier"].detach().cpu().numpy()
     if x.shape[1] > 4:
-        return x[:, 4]
-    return np.zeros((x.shape[0],), dtype=np.float32)
+        return int(np.argmax(x[:, 4]))
+    return 0
 
 
 def _metrics(records):
@@ -56,6 +59,16 @@ def _record(costs, scores, best_idx):
     }
 
 
+def _distance_record(costs, sample, best_idx):
+    if len(costs) == 0 or best_idx < 0:
+        return None
+    idx = distance_baseline_idx(sample)
+    idx = idx if 0 <= idx < len(costs) else 0
+    scores = np.full((len(costs),), -1e6, dtype=np.float32)
+    scores[idx] = 1.0
+    return _record(costs, scores, best_idx)
+
+
 @torch.no_grad()
 def evaluate_dataset(dataset, ckpt=None, device="cpu", seed=0):
     model = None
@@ -67,8 +80,11 @@ def evaluate_dataset(dataset, ckpt=None, device="cpu", seed=0):
 
     rng = np.random.default_rng(seed)
     records = {"random": [], "distance": [], "teacher": [], "gnn": []}
+    pred_teacher_agreements = []
+    label_type_counts = Counter()
     for sample in dataset:
         labels = sample["labels"]
+        label_type_counts[str(labels.get("label_type", "missing"))] += 1
         costs = labels["frontier_cost"]
         if hasattr(costs, "detach"):
             costs = costs.detach().cpu().numpy()
@@ -82,17 +98,20 @@ def evaluate_dataset(dataset, ckpt=None, device="cpu", seed=0):
         if rec:
             records["random"].append(rec)
 
-        rec = _record(costs, _distance_scores(sample), best_idx)
+        rec = _distance_record(costs, sample, best_idx)
         if rec:
             records["distance"].append(rec)
 
+        teacher_pred = None
         teacher_scores = labels.get("teacher_scores")
         if teacher_scores is not None:
             if hasattr(teacher_scores, "detach"):
                 teacher_scores = teacher_scores.detach().cpu().numpy()
-            rec = _record(costs, np.asarray(teacher_scores, dtype=np.float32), best_idx)
+            teacher_scores = np.asarray(teacher_scores, dtype=np.float32)
+            rec = _record(costs, teacher_scores, best_idx)
             if rec:
                 records["teacher"].append(rec)
+                teacher_pred = int(rec["pred"])
 
         if model is not None:
             graph = sample["graph"].to(device)
@@ -100,24 +119,26 @@ def evaluate_dataset(dataset, ckpt=None, device="cpu", seed=0):
             rec = _record(costs, logits, best_idx)
             if rec:
                 records["gnn"].append(rec)
+                if teacher_pred is not None:
+                    pred_teacher_agreements.append(float(int(rec["pred"]) == teacher_pred))
 
     metrics = {name: _metrics(vals) for name, vals in records.items() if vals or name != "gnn" or model is not None}
     gnn_metrics = metrics.get("gnn", {})
     teacher_metrics = metrics.get("teacher", {})
     summary = {
-        "pred_oracle_top1": float(gnn_metrics.get("top1", 0.0)),
-        "pred_oracle_top3": float(gnn_metrics.get("top3", 0.0)),
+        "pred_label_top1": float(gnn_metrics.get("top1", 0.0)),
+        "pred_label_top3": float(gnn_metrics.get("top3", 0.0)),
         "pred_cost_ratio": float(gnn_metrics.get("cost_ratio", 0.0)),
+        "cost_ratio": float(gnn_metrics.get("cost_ratio", 0.0)),
         "teacher_cost_ratio": float(teacher_metrics.get("cost_ratio", 0.0)),
         "distance_cost_ratio": float(metrics.get("distance", {}).get("cost_ratio", 0.0)),
         "random_cost_ratio": float(metrics.get("random", {}).get("cost_ratio", 0.0)),
-        "teacher_oracle_agreement": float(teacher_metrics.get("top1", 0.0)),
+        "teacher_label_agreement": float(teacher_metrics.get("top1", 0.0)),
         "pred_teacher_agreement": 0.0,
     }
-    if records.get("gnn") and records.get("teacher"):
-        pairs = zip(records["gnn"], records["teacher"])
-        vals = [float(g["pred"] == t["pred"]) for g, t in pairs]
-        summary["pred_teacher_agreement"] = float(np.mean(vals)) if vals else 0.0
+    if pred_teacher_agreements:
+        summary["pred_teacher_agreement"] = float(np.mean(pred_teacher_agreements))
+    summary["label_type_counts"] = dict(label_type_counts)
     metrics["summary"] = summary
     return metrics
 

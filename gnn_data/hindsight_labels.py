@@ -113,7 +113,13 @@ def _fmm_distance_to_goal(sample: dict, goal_rc: np.ndarray):
         return None
 
 
-def frontier_to_goal_cost(sample: dict, goal_rc, lambda_goal: float = 1.0, prefer_fmm: bool = True) -> np.ndarray:
+def frontier_to_goal_cost(
+    sample: dict,
+    goal_rc,
+    lambda_goal: float = 1.0,
+    prefer_fmm: bool = True,
+    allow_approx_fallback: bool = True,
+) -> np.ndarray:
     centers = frontier_centers_rc(sample)
     path = path_costs(sample)
     if len(path) != len(centers):
@@ -133,6 +139,8 @@ def frontier_to_goal_cost(sample: dict, goal_rc, lambda_goal: float = 1.0, prefe
                 c = int(np.clip(round(float(center[1])), 0, dist_map.shape[1] - 1))
                 vals.append(float(dist_map[r, c]) * map_resolution_cm / 100.0)
             goal_dist = np.asarray(vals, dtype=np.float32)
+    if goal_dist is None and not allow_approx_fallback:
+        raise ValueError("skipped_missing_final_map_fmm")
     if goal_dist is None:
         goal_dist = np.linalg.norm(centers - goal_rc.reshape(1, 2), axis=1) * map_resolution_cm / 100.0
     return path.astype(np.float32) + float(lambda_goal) * goal_dist.astype(np.float32)
@@ -165,9 +173,16 @@ def label_with_goal_rc(
     lambda_goal: float,
     label_type: str,
     label_source: str = "sample_goal_rc",
+    allow_approx_fallback: bool = True,
 ) -> dict:
     out = copy.deepcopy(sample)
-    costs = frontier_to_goal_cost(out, goal_rc=goal_rc, lambda_goal=lambda_goal, prefer_fmm=True)
+    costs = frontier_to_goal_cost(
+        out,
+        goal_rc=goal_rc,
+        lambda_goal=lambda_goal,
+        prefer_fmm=True,
+        allow_approx_fallback=allow_approx_fallback,
+    )
     out["labels"] = make_label_payload(
         costs,
         tau=tau,
@@ -208,6 +223,7 @@ def pseudo_goal_objects(
     exclude_unknown: bool = False,
     exclude_rejected_candidates: bool = False,
     balance_categories: bool = False,
+    require_stable: bool = False,
 ) -> List[dict]:
     out = []
     per_category = defaultdict(int)
@@ -219,6 +235,8 @@ def pseudo_goal_objects(
         if not _valid_category(category, exclude_unknown=exclude_unknown):
             continue
         if exclude_rejected_candidates and bool(obj.get("rejected_candidate", False)):
+            continue
+        if require_stable and "stable" in obj and not bool(obj.get("stable", False)):
             continue
         confidence = float(obj.get("confidence", 1.0))
         if confidence < min_confidence:

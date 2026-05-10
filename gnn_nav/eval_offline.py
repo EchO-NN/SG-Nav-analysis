@@ -9,7 +9,7 @@ from gnn_nav.model import GoalConditionedGraphNet
 from gnn_nav.train_gnn import evaluate, make_loader
 
 
-def teacher_agreement(dataset):
+def teacher_label_agreement(dataset):
     total = 0
     agree = 0
     for sample in dataset:
@@ -44,9 +44,9 @@ def main():
     model.eval()
 
     metrics = evaluate(model, make_loader(dataset, shuffle=False), device)
-    agreement, agreement_count = teacher_agreement(dataset)
+    agreement, agreement_count = teacher_label_agreement(dataset)
     print("metrics", metrics)
-    print("teacher_agreement", {"top1": agreement, "count": agreement_count})
+    print("teacher_label_agreement", {"top1": agreement, "count": agreement_count})
 
 
 if __name__ == "__main__":

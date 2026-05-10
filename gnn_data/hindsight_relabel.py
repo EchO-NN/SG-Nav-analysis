@@ -101,7 +101,16 @@ def _teacher_fields(sample):
     return out
 
 
-def label_step_with_final_map(step_sample, episode_summary, tau=2.0, lambda_goal=1.0, min_label_frontiers=2):
+def label_step_with_final_map(
+    step_sample,
+    episode_summary,
+    tau=2.0,
+    lambda_goal=1.0,
+    min_label_frontiers=2,
+    output_label_type="hindsight_goal_final_map",
+    label_source="episode_summary_final_map",
+    episode_summary_path=None,
+):
     metadata = step_sample.get("metadata", {})
     frontiers = _frontiers(step_sample)
     if len(frontiers) < int(min_label_frontiers):
@@ -143,10 +152,13 @@ def label_step_with_final_map(step_sample, episode_summary, tau=2.0, lambda_goal
         "frontier_cost": torch.tensor(costs, dtype=torch.float32),
         "frontier_y_soft": torch.tensor(y_soft, dtype=torch.float32),
         "frontier_best_idx": int(best_idx),
-        "label_type": "hindsight_goal_final_map",
-        "label_source": f"episode_summary_{target_goal.get('source', 'found_goal')}",
+        "label_type": output_label_type,
+        "label_source": label_source,
+        "hindsight_goal_rc": torch.tensor(goal_rc, dtype=torch.float32),
         "found_goal_rc": torch.tensor(goal_rc, dtype=torch.float32),
         "frontier_goal_final_map_dist": torch.tensor(d_goal, dtype=torch.float32),
+        "episode_summary_path": "" if episode_summary_path is None else str(episode_summary_path),
+        "target_goal_source": str(target_goal.get("source", "unknown")),
     }
     labels.update(_teacher_fields(step_sample))
     out = dict(step_sample)
@@ -214,6 +226,9 @@ def main():
                 tau=args.tau,
                 lambda_goal=args.lambda_goal,
                 min_label_frontiers=args.min_label_frontiers,
+                output_label_type="hindsight_goal_final_map",
+                label_source=f"episode_summary_{summary.get('target_goal', {}).get('source', 'found_goal')}",
+                episode_summary_path=candidates[-1][0],
             )
         except Exception as exc:
             reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"

@@ -14,6 +14,7 @@ from gnn_data.hindsight_labels import (
     label_with_goal_rc,
     pseudo_goal_objects,
 )
+from gnn_data.hindsight_relabel import _episode_key, label_step_with_final_map, load_summaries
 from gnn_data.raw_schema import LABEL_VERSION, make_soft_frontier_label, softmax_scores
 from gnn_nav.dataset import safe_torch_load
 
@@ -128,7 +129,6 @@ def _canonical_mode(label_mode: str) -> str:
         "teacher_debug": "teacher",
         "oracle_geodesic_diagnostic": "simulator_geodesic",
         "oracle_approx_debug": "oracle_approx_map",
-        "final_map_hindsight_strict": "final_map_hindsight",
     }
     return aliases.get(label_mode, label_mode)
 
@@ -150,6 +150,9 @@ def label_sample(
     require_hindsight_or_oracle: bool = False,
     min_label_frontiers: int = 1,
     allow_unvalidated_geodesic: bool = False,
+    episode_summary: dict = None,
+    episode_summary_path: str = None,
+    allow_failed_hindsight_debug: bool = False,
 ):
     original_label_mode = label_mode
     label_mode = _canonical_mode(label_mode)
@@ -193,35 +196,90 @@ def label_sample(
         goal_rc = goal_rc_from_sample(sample)
         if goal_rc is None:
             raise ValueError(f"{label_mode} mode requires a goal rc field in sample['goal'], metadata, or agent")
-        out = label_with_goal_rc(
-            sample,
-            goal_rc,
-            tau=tau,
-            lambda_goal=lambda_goal,
-            label_type=label_mode,
-            label_source="sample_goal_rc",
-        )
+        try:
+            out = label_with_goal_rc(
+                sample,
+                goal_rc,
+                tau=tau,
+                lambda_goal=lambda_goal,
+                label_type=label_mode,
+                label_source="sample_goal_rc",
+                allow_approx_fallback=not (strict_labels or forbid_approx_fallback),
+            )
+        except Exception as exc:
+            reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"
+            raise SkipSample(reason) from exc
         sample.clear()
         sample.update(out)
         costs = _as_numpy(sample["labels"]["frontier_cost"]).astype(np.float32)
         y_soft = _as_numpy(sample["labels"]["frontier_y_soft"]).astype(np.float32)
         best_idx = int(sample["labels"]["frontier_best_idx"])
         label_type = str(sample["labels"]["label_type"])
+        for key in [
+            "label_source",
+            "hindsight_goal_rc",
+            "found_goal_rc",
+            "frontier_goal_final_map_dist",
+            "episode_summary_path",
+            "target_goal_source",
+        ]:
+            extra_label_fields[key] = sample["labels"].get(key)
         extra_label_fields["hindsight_goal_rc"] = sample["labels"].get("hindsight_goal_rc")
+    elif label_mode == "final_map_hindsight_strict":
+        if episode_summary is None:
+            raise SkipSample("skipped_missing_episode_summary")
+        if not bool(episode_summary.get("metadata", {}).get("success", False)) and not allow_failed_hindsight_debug:
+            raise SkipSample("skipped_no_success")
+        try:
+            out = label_step_with_final_map(
+                sample,
+                episode_summary,
+                tau=tau,
+                lambda_goal=lambda_goal,
+                min_label_frontiers=min_label_frontiers,
+                output_label_type="final_map_hindsight_strict",
+                label_source="episode_summary_final_map",
+                episode_summary_path=episode_summary_path,
+            )
+        except Exception as exc:
+            reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"
+            raise SkipSample(reason) from exc
+        sample.clear()
+        sample.update(out)
+        costs = _as_numpy(sample["labels"]["frontier_cost"]).astype(np.float32)
+        y_soft = _as_numpy(sample["labels"]["frontier_y_soft"]).astype(np.float32)
+        best_idx = int(sample["labels"]["frontier_best_idx"])
+        label_type = str(sample["labels"]["label_type"])
+        for key in [
+            "label_source",
+            "hindsight_goal_rc",
+            "found_goal_rc",
+            "frontier_goal_final_map_dist",
+            "episode_summary_path",
+            "target_goal_source",
+        ]:
+            extra_label_fields[key] = sample["labels"].get(key)
     elif label_mode == "hybrid":
         oracle = _oracle_saved(sample, allow_unvalidated_geodesic=allow_unvalidated_geodesic)
         if oracle is not None:
             costs, y_soft, best_idx, label_type = oracle
             label_type = f"{label_type}+teacher" if teacher_y is not None else label_type
         elif goal_rc_from_sample(sample) is not None:
-            out = label_with_goal_rc(
-                sample,
-                goal_rc_from_sample(sample),
-                tau=tau,
-                lambda_goal=lambda_goal,
-                label_type="hindsight_goal+teacher" if teacher_y is not None else "hindsight_goal",
-                label_source="sample_goal_rc",
-            )
+            try:
+                out = label_with_goal_rc(
+                    sample,
+                    goal_rc_from_sample(sample),
+                    tau=tau,
+                    lambda_goal=lambda_goal,
+                    label_type="hindsight_goal+teacher" if teacher_y is not None else "hindsight_goal",
+                    label_source="sample_goal_rc",
+                    allow_approx_fallback=not (strict_labels or forbid_approx_fallback),
+                )
+            except Exception as exc:
+                if strict_labels or forbid_approx_fallback or require_hindsight_or_oracle:
+                    reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"
+                    raise SkipSample(reason) from exc
+                raise
             sample.clear()
             sample.update(out)
             costs = _as_numpy(sample["labels"]["frontier_cost"]).astype(np.float32)
@@ -246,14 +304,19 @@ def label_sample(
     elif label_mode == "hybrid_hindsight_first":
         goal_rc = goal_rc_from_sample(sample)
         if goal_rc is not None:
-            out = label_with_goal_rc(
-                sample,
-                goal_rc,
-                tau=tau,
-                lambda_goal=lambda_goal,
-                label_type="hindsight_goal",
-                label_source="sample_goal_rc",
-            )
+            try:
+                out = label_with_goal_rc(
+                    sample,
+                    goal_rc,
+                    tau=tau,
+                    lambda_goal=lambda_goal,
+                    label_type="hindsight_goal",
+                    label_source="sample_goal_rc",
+                    allow_approx_fallback=not (strict_labels or forbid_approx_fallback),
+                )
+            except Exception as exc:
+                reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"
+                raise SkipSample(reason) from exc
             sample.clear()
             sample.update(out)
             costs = _as_numpy(sample["labels"]["frontier_cost"]).astype(np.float32)
@@ -315,8 +378,26 @@ def label_samples(
     if label_mode not in ["hindsight_all_objects", "hindsight_all_objects_strict"]:
         return [label_sample(sample, label_mode, tau, teacher_temperature, lambda_goal, **label_kwargs)]
 
+    pseudo_source_sample = sample
+    episode_summary = label_kwargs.get("episode_summary")
+    episode_summary_path = label_kwargs.get("episode_summary_path")
+    if strict_all_objects and episode_summary is None:
+        raise SkipSample("skipped_missing_episode_summary")
+    if strict_all_objects and episode_summary is not None:
+        pseudo_source_sample = copy.deepcopy(sample)
+        pseudo_source_sample.setdefault("scenegraph", {})
+        pseudo_source_sample["scenegraph"] = dict(pseudo_source_sample["scenegraph"])
+        pseudo_source_sample["scenegraph"]["objects"] = list(episode_summary.get("discovered_objects", []))
+        pseudo_source_sample.setdefault("maps", {})
+        pseudo_source_sample["maps"] = dict(pseudo_source_sample["maps"])
+        final_maps = episode_summary.get("final_maps", {})
+        if final_maps.get("free_map") is not None:
+            pseudo_source_sample["maps"]["final_free_map"] = final_maps.get("free_map")
+        if final_maps.get("full_map") is not None:
+            pseudo_source_sample["maps"]["final_full_map"] = final_maps.get("full_map")
+
     pseudo_goals = pseudo_goal_objects(
-        sample,
+        pseudo_source_sample,
         min_confidence=pseudo_goal_min_confidence,
         min_observed_count=pseudo_goal_min_observed_count,
         min_lifetime_steps=pseudo_goal_min_lifetime_steps,
@@ -324,12 +405,14 @@ def label_samples(
         exclude_unknown=pseudo_goal_exclude_unknown or strict_all_objects,
         exclude_rejected_candidates=pseudo_goal_exclude_rejected_candidates or strict_all_objects,
         balance_categories=pseudo_goal_balance_categories,
+        require_stable=strict_all_objects,
     )
     if not pseudo_goals:
         raise SkipSample("skipped_no_valid_pseudo_goal")
     out = []
+    pseudo_skip_reasons = Counter()
     for idx, pseudo in enumerate(pseudo_goals):
-        relabeled = copy.deepcopy(sample)
+        relabeled = copy.deepcopy(pseudo_source_sample)
         relabeled.setdefault("goal", {})
         relabeled["goal"] = dict(relabeled["goal"])
         relabeled["goal"]["object_category_raw"] = pseudo["goal_text"]
@@ -338,14 +421,38 @@ def label_samples(
         relabeled["goal"]["hindsight_pseudo_goal"] = True
         relabeled["goal"]["source_node_id"] = pseudo.get("source_node_id")
         relabeled["goal"]["goal_rc"] = pseudo["goal_rc"]
-        relabeled = label_with_goal_rc(
-            relabeled,
-            pseudo["goal_rc"],
-            tau=tau,
-            lambda_goal=lambda_goal,
-            label_type="hindsight_all_objects_strict" if strict_all_objects else "hindsight_all_objects",
-            label_source="scenegraph_object_pseudo_goal",
-        )
+        if strict_all_objects:
+            pseudo_summary = copy.deepcopy(episode_summary)
+            pseudo_summary.setdefault("target_goal", {})
+            pseudo_summary["target_goal"] = dict(pseudo_summary["target_goal"])
+            pseudo_summary["target_goal"]["goal_text"] = pseudo["goal_text"]
+            pseudo_summary["target_goal"]["found_goal_rc"] = pseudo["goal_rc"]
+            pseudo_summary["target_goal"]["source"] = "episode_summary_discovered_object"
+            pseudo_summary["target_goal"]["confidence"] = float(pseudo["confidence"])
+            try:
+                relabeled = label_step_with_final_map(
+                    relabeled,
+                    pseudo_summary,
+                    tau=tau,
+                    lambda_goal=lambda_goal,
+                    min_label_frontiers=int(label_kwargs.get("min_label_frontiers", 1)),
+                    output_label_type="hindsight_all_objects_strict",
+                    label_source="episode_summary_discovered_object",
+                    episode_summary_path=episode_summary_path,
+                )
+            except Exception as exc:
+                reason = str(exc) if str(exc).startswith("skipped_") else f"skipped_{str(exc)}"
+                pseudo_skip_reasons[reason] += 1
+                continue
+        else:
+            relabeled = label_with_goal_rc(
+                relabeled,
+                pseudo["goal_rc"],
+                tau=tau,
+                lambda_goal=lambda_goal,
+                label_type="hindsight_all_objects",
+                label_source="scenegraph_object_pseudo_goal",
+            )
         relabeled["version"] = LABEL_VERSION
         relabeled["labels"]["pseudo_goal_text"] = pseudo["goal_text"]
         relabeled["labels"]["pseudo_goal_index"] = int(idx)
@@ -356,7 +463,13 @@ def label_samples(
         relabeled["labels"]["pseudo_goal_source_node_id"] = (
             -1 if pseudo.get("source_node_id") is None else int(pseudo.get("source_node_id"))
         )
+        relabeled["labels"]["episode_summary_path"] = "" if episode_summary_path is None else str(episode_summary_path)
         out.append(relabeled)
+    if not out:
+        if pseudo_skip_reasons:
+            reason = pseudo_skip_reasons.most_common(1)[0][0]
+            raise SkipSample(reason)
+        raise SkipSample("skipped_no_valid_pseudo_goal")
     return out
 
 
@@ -364,6 +477,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--episode_summary_dir", type=str, default=None)
     parser.add_argument(
         "--label_mode",
         type=str,
@@ -404,6 +518,7 @@ def main():
     parser.add_argument("--skip_unlabeled", action="store_true")
     parser.add_argument("--write_label_report", nargs="?", const="label_report.json", default=None)
     parser.add_argument("--allow_unvalidated_geodesic", action="store_true")
+    parser.add_argument("--allow_failed_hindsight_debug", action="store_true")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--skip_errors", action="store_true")
     args = parser.parse_args()
@@ -412,15 +527,26 @@ def main():
     if args.max_samples is not None:
         paths = paths[: args.max_samples]
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    summaries = load_summaries(args.episode_summary_dir) if args.episode_summary_dir else {}
 
     count = 0
     skipped = 0
     label_type_counts = Counter()
     skip_reason_counts = Counter()
+    pseudo_goal_category_counts = Counter()
     output_dir = Path(args.output_dir)
     for path in paths:
         try:
             sample = safe_torch_load(path, map_location="cpu")
+            episode_summary = None
+            episode_summary_path = None
+            if args.episode_summary_dir:
+                key = _episode_key(sample.get("metadata", {}))
+                candidates = summaries.get(key, [])
+                if candidates:
+                    episode_summary_path, episode_summary = candidates[-1]
+                elif args.label_mode in ["final_map_hindsight_strict", "hindsight_all_objects_strict"]:
+                    raise SkipSample("skipped_missing_episode_summary")
             labeled_samples = label_samples(
                 sample,
                 args.label_mode,
@@ -440,6 +566,9 @@ def main():
                 require_hindsight_or_oracle=args.require_hindsight_or_oracle,
                 min_label_frontiers=args.min_label_frontiers,
                 allow_unvalidated_geodesic=args.allow_unvalidated_geodesic,
+                episode_summary=episode_summary,
+                episode_summary_path=episode_summary_path,
+                allow_failed_hindsight_debug=args.allow_failed_hindsight_debug,
             )
         except SkipSample as exc:
             if args.skip_unlabeled or args.skip_errors or args.strict_labels:
@@ -471,16 +600,21 @@ def main():
             count += 1
             label_type = str(labeled_sample.get("labels", {}).get("label_type", "missing"))
             label_type_counts[label_type] += 1
+            pseudo_goal_text = labeled_sample.get("labels", {}).get("pseudo_goal_text")
+            if pseudo_goal_text is not None:
+                pseudo_goal_category_counts[str(pseudo_goal_text)] += 1
 
     report = {
         "input_dir": args.input_dir,
         "output_dir": args.output_dir,
+        "episode_summary_dir": args.episode_summary_dir,
         "label_mode": args.label_mode,
         "num_input_files": len(paths),
         "num_labeled_samples": count,
         "num_skipped_samples": skipped,
         "label_type_counts": dict(label_type_counts),
         "skip_reason_counts": dict(skip_reason_counts),
+        "pseudo_goal_category_counts": dict(pseudo_goal_category_counts),
         "strict_labels": bool(args.strict_labels),
         "forbid_teacher_fallback": bool(args.forbid_teacher_fallback),
         "forbid_approx_fallback": bool(args.forbid_approx_fallback),

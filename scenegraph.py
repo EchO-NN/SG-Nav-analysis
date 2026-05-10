@@ -314,6 +314,10 @@ Final probability:'''
 
     def set_agent(self, agent):
         self.agent = agent
+        args = getattr(agent, "args", None)
+        self.disable_llm_edges = bool(getattr(args, "disable_llm_edges", False))
+        self.sparse_graph_only = bool(getattr(args, "sparse_graph_only", False))
+        self.gnn_keyframe_update_k = int(getattr(args, "gnn_keyframe_update_k", 5))
 
     def set_debug(self, enabled=False, log_dir="data/debug_sgnav"):
         self.debug_enabled = enabled
@@ -755,6 +759,11 @@ Final probability:'''
                 new_edges.append(new_edge)
                 created_count += 1
         self.debug_stats.inc("edges_created", created_count)
+        if bool(getattr(self, "disable_llm_edges", False)) or bool(getattr(self, "sparse_graph_only", False)):
+            self.debug_stats.inc("edges_skipped_sparse_mode", created_count)
+            for new_edge in new_edges:
+                new_edge.delete()
+            return
         # get all new_edges
         new_edges = set()
         for i, node in enumerate(self.nodes):
@@ -956,6 +965,16 @@ Final probability:'''
     
     def update_scenegraph(self):
         print(f'Navigate Step: {self.navigate_steps}', end='\r')
+        if bool(getattr(self, "sparse_graph_only", False)):
+            keyframe_k = max(1, int(getattr(self, "gnn_keyframe_update_k", 5)))
+            force_update = bool(
+                getattr(self.agent, "found_possible_goal", False)
+                or getattr(self.agent, "found_goal", False)
+                or int(getattr(self.agent, "not_move_steps", 0)) > 0
+            )
+            if keyframe_k > 1 and self.navigate_steps % keyframe_k != 0 and not force_update:
+                self.debug_stats.inc("sparse_keyframe_skipped")
+                return
         self.segment2d()
         if len(self.segment2d_results) > 0:
             self.mapping3d()

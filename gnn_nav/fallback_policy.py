@@ -40,6 +40,21 @@ def frontier_uncertainty(scores) -> Dict[str, float]:
     }
 
 
+def zscore(values) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return values
+    return (values - float(values.mean())) / (float(values.std()) + 1e-6)
+
+
+def combine_scores(gnn_scores, fallback_scores, alpha: float = 1.0) -> np.ndarray:
+    gnn_scores = np.asarray(gnn_scores, dtype=np.float32).reshape(-1)
+    fallback_scores = np.asarray(fallback_scores, dtype=np.float32).reshape(-1)
+    if gnn_scores.shape != fallback_scores.shape:
+        raise ValueError(f"score shape mismatch: gnn={gnn_scores.shape}, fallback={fallback_scores.shape}")
+    return zscore(gnn_scores) + float(alpha) * zscore(fallback_scores)
+
+
 class GNNFallbackPolicy:
     """Uncertainty rules for future VLM/LLM fallback integration.
 

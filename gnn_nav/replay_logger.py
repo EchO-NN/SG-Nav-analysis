@@ -18,7 +18,16 @@ class GNNReplayLogger:
         if self.enabled:
             os.makedirs(log_dir, exist_ok=True)
 
-    def save_step(self, graph, frontier_clusters, goal_text, metadata, teacher_scores=None, selected_idx=None):
+    def save_step(
+        self,
+        graph,
+        frontier_clusters,
+        goal_text,
+        metadata,
+        teacher_scores=None,
+        selected_idx=None,
+        fallback_record=None,
+    ):
         if not self.enabled or len(frontier_clusters) == 0:
             return None
 
@@ -47,6 +56,9 @@ class GNNReplayLogger:
             "teacher": {
                 "sgnav_scores": teacher_scores,
                 "selected_frontier_idx": selected_idx,
+            },
+            "debug": {
+                "gnn_fallback": fallback_record,
             },
         }
 
