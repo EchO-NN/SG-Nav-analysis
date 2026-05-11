@@ -38,19 +38,34 @@ from utils.image_process import (
 )
 
 
+def startup_log(message):
+    print(f"[SGNAV_STARTUP] {message}", flush=True)
+
+
 class SG_Nav_Agent():
     def __init__(self, task_config, args=None):
+        startup_log("agent init begin")
         self._POSSIBLE_ACTIONS = task_config.TASK.POSSIBLE_ACTIONS
         self.config = task_config
         self.args = args
         self.panoramic = []
         self.panoramic_depth = []
         self.turn_angles = 0
+        self.force_cpu = os.environ.get("SGNAV_FORCE_CPU", "0") not in [
+            "0",
+            "false",
+            "False",
+        ]
         self.device = (
-            torch.device("cuda:{}".format(0))
-            if torch.cuda.is_available()
-            else torch.device("cpu")
+            torch.device("cpu")
+            if self.force_cpu
+            else (
+                torch.device("cuda:{}".format(0))
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
         )
+        startup_log(f"torch device={self.device}")
         self.prev_action = 0
         self.navigate_steps = 0
         self.move_steps = 0
@@ -90,29 +105,66 @@ class SG_Nav_Agent():
         )
         self.rejected_goal_ttl = int(getattr(self.args, "rejected_goal_ttl", 80))
         self.found_goal_stop_distance_m = max(
-            0.05, float(getattr(self.args, "found_goal_stop_distance_m", 0.35))
+            0.05, float(getattr(self.args, "found_goal_stop_distance_m", 0.30))
+        )
+        self.stop_verification_steps = max(
+            0, int(getattr(self.args, "stop_verification_steps", 4))
+        )
+        self.stop_verification_min_hits = max(
+            1, int(getattr(self.args, "stop_verification_min_hits", 2))
+        )
+        self.stop_verification_same_goal_radius_m = float(
+            getattr(self.args, "stop_verification_same_goal_radius_m", 1.0)
+        )
+        self.stop_verification_max_detection_distance_m = float(
+            getattr(self.args, "stop_verification_max_detection_distance_m", 2.5)
+        )
+        self.stop_verification_goal_node_radius_m = float(
+            getattr(self.args, "stop_verification_goal_node_radius_m", 2.0)
+        )
+        self.stop_verification_turn_action = int(
+            getattr(self.args, "stop_verification_turn_action", 3)
+        )
+        self.direct_goal_approach_enabled = bool(
+            int(getattr(self.args, "direct_goal_approach_enabled", 1))
+        )
+        self.direct_goal_approach_min_distance_m = float(
+            getattr(self.args, "direct_goal_approach_min_distance_m", 0.35)
+        )
+        self.direct_goal_approach_turn_threshold_deg = float(
+            getattr(self.args, "direct_goal_approach_turn_threshold_deg", 20.0)
+        )
+        self.direct_goal_approach_max_detection_distance_m = float(
+            getattr(self.args, "direct_goal_approach_max_detection_distance_m", 4.5)
+        )
+        self.direct_goal_approach_max_steps = max(
+            0, int(getattr(self.args, "direct_goal_approach_max_steps", 20))
         )
         self.reset_reperception_state()
+        self.reset_stop_verification_state()
         self.rooms = rooms
         self.rooms_captions = rooms_captions
         self.split = (self.args.split_l >= 0)
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
 
         ### ------ init glip model ------ ###
+        startup_log("GLIP init begin")
         config_file = "GLIP/configs/pretrain/glip_Swin_L.yaml" 
         weight_file = "GLIP/MODEL/glip_large_model.pth"
         glip_cfg.local_rank = 0
         glip_cfg.num_gpus = 1
         glip_cfg.merge_from_file(config_file) 
         glip_cfg.merge_from_list(["MODEL.WEIGHT", weight_file])
-        glip_cfg.merge_from_list(["MODEL.DEVICE", "cuda"])
+        glip_cfg.merge_from_list(["MODEL.DEVICE", "cpu" if self.force_cpu else "cuda"])
         self.glip_demo = GLIPDemo(
             glip_cfg,
             min_image_size=800,
             confidence_threshold=0.61,
             show_mask_heatmaps=False
         )
+        startup_log("GLIP init done")
 
+        startup_log("mapping init begin")
         self.map_size_cm = 4000
         self.resolution = self.map_resolution = 5
         self.camera_horizon = 0
@@ -134,7 +186,9 @@ class SG_Nav_Agent():
         self.room_map_module.set_view_angles(self.camera_horizon)
 
         self.camera_matrix = self.free_map_module.camera_matrix
+        startup_log("mapping init done")
         
+        startup_log("co-occurrence matrices load begin")
         self.goal_idx = {}
         for key in projection:
             self.goal_idx[projection[key]] = categories_21.index(projection[key])
@@ -145,7 +199,9 @@ class SG_Nav_Agent():
         self.co_occur_room_mtx = np.load('tools/room.npy')
         self.co_occur_room_mtx -= self.co_occur_room_mtx.min()
         self.co_occur_room_mtx /= self.co_occur_room_mtx.max()
+        startup_log("co-occurrence matrices load done")
         
+        startup_log("scene graph init begin")
         self.scenegraph = SceneGraph(map_resolution=self.map_resolution, map_size_cm=self.map_size_cm, map_size=self.map_size, camera_matrix=self.camera_matrix, agent=self)
         self.debug_sgnav = bool(getattr(self.args, "debug_sgnav", False))
         self.debug_sgnav_dir = getattr(self.args, "debug_sgnav_dir", "data/debug_sgnav")
@@ -163,7 +219,7 @@ class SG_Nav_Agent():
 
         self.visualization_dir = f'data/visualization/{self.experiment_name}/'
 
-        print('scene graph module init finish!!!')
+        startup_log("scene graph module init finish")
 
     def add_predicates(self, model):
         predicate = Predicate('IsNearObj', closed = True, size = 2)
@@ -247,8 +303,19 @@ class SG_Nav_Agent():
         self.stop_reason = ''
         self.episode_logged = False
         self.reset_reperception_state()
+        self.reset_stop_verification_state()
 
         self.scenegraph.reset()
+
+    def reset_stop_verification_state(self, clear_history=True):
+        self.stop_verification_active = False
+        self.stop_verification_target_gps = None
+        self.stop_verification_steps_taken = 0
+        self.stop_verification_hits = 0
+        self.stop_verification_consecutive_failures = 0
+        self.direct_goal_approach_steps = 0
+        if clear_history:
+            self.stop_verification_history = []
 
     def reset_reperception_state(self):
         self.reperception_active = False
@@ -481,6 +548,290 @@ class SG_Nav_Agent():
         self.reperception_steps = 0
         self.reperception_observation_count = 0
         self.scenegraph.debug_stats.inc("reperception_rejected")
+
+    def goal_label_matches(self, label):
+        label = str(label).lower().replace(" ", "_")
+        goal = str(self.obj_goal).lower().replace(" ", "_")
+        if goal == "gym_equipment":
+            return label in ["gym_equipment", "treadmill", "exercise_machine"]
+        if goal == "chest_of_drawers":
+            return label in ["chest_of_drawers", "drawers"] or "drawers" in label
+        if goal == "tv_monitor":
+            return label in ["tv_monitor", "tv"] or label == "television"
+        return goal == label or goal in label
+
+    def estimate_goal_from_bbox(self, observations, bbox):
+        box = bbox.to(torch.int64)
+        center_point = (box[:2] + box[2:]) // 2
+        width = self.config.SIMULATOR.RGB_SENSOR.WIDTH
+        height = self.config.SIMULATOR.RGB_SENSOR.HEIGHT
+        x = int(np.clip(center_point[0].item(), 0, width - 1))
+        y = int(np.clip(center_point[1].item(), 0, height - 1))
+        temp_distance = float(self.depth[y, x, 0])
+        k = 0
+        pos_neg = 1
+        while (
+            temp_distance >= 100
+            and 0 < y + int(pos_neg * k) < height - 1
+            and 0 < x + int(pos_neg * k) < width - 1
+        ):
+            pos_neg *= -1
+            k += 0.5
+            temp_distance = max(
+                float(self.depth[y + int(pos_neg * k), x, 0]),
+                float(self.depth[y, x + int(pos_neg * k), 0]),
+            )
+        if not np.isfinite(temp_distance) or temp_distance >= 100:
+            return None
+        hfov = self.config.SIMULATOR.RGB_SENSOR.HFOV
+        temp_direction = (x - width / 2) * hfov / width
+        goal_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
+        return goal_gps, temp_distance, temp_direction
+
+    def estimate_bbox_direction(self, bbox):
+        box = bbox.to(torch.int64)
+        center_point = (box[:2] + box[2:]) // 2
+        width = self.config.SIMULATOR.RGB_SENSOR.WIDTH
+        x = int(np.clip(center_point[0].item(), 0, width - 1))
+        hfov = self.config.SIMULATOR.RGB_SENSOR.HFOV
+        return float((x - width / 2) * hfov / width)
+
+    def get_goal_node_support(self, goal_gps):
+        if self.stop_verification_goal_node_radius_m <= 0:
+            return {"supported": True, "best": None}
+        target_xy = self.goal_gps_to_map_xy(goal_gps)
+        best = None
+        best_dist_m = float("inf")
+        for node in self.scenegraph.nodes:
+            if getattr(node, "center", None) is None:
+                continue
+            if not (
+                getattr(node, "is_goal_node", False)
+                or self.goal_label_matches(getattr(node, "caption", ""))
+            ):
+                continue
+            center_xy = np.asarray(node.center, dtype=np.float32)
+            dist_m = float(np.linalg.norm(center_xy - target_xy) * self.map_resolution / 100.0)
+            if dist_m < best_dist_m:
+                best_dist_m = dist_m
+                best = {
+                    "caption": getattr(node, "caption", ""),
+                    "distance": dist_m,
+                    "center": center_xy.tolist(),
+                }
+        return {
+            "supported": best is not None and best_dist_m <= self.stop_verification_goal_node_radius_m,
+            "best": best,
+        }
+
+    def observe_stop_verification(self, observations):
+        prediction = self.glip_demo.inference(
+            observations["rgb"][:, :, [2, 1, 0]],
+            object_captions,
+        )
+        labels = self.get_glip_real_label(prediction)
+        scores = prediction.get_field("scores")
+        target_gps = self.stop_verification_target_gps
+        best = None
+        best_label_only = None
+        best_delta = float("inf")
+        for idx, label in enumerate(labels):
+            if not self.goal_label_matches(label):
+                continue
+            score = self.confidence_to_float(scores[idx])
+            label_only = {
+                "label": str(label),
+                "score": score,
+                "distance": None,
+                "delta": None,
+                "direction": self.estimate_bbox_direction(prediction.bbox[idx]),
+                "gps": np.asarray(target_gps, dtype=np.float32).tolist(),
+                "depth_valid": False,
+            }
+            if best_label_only is None or score > best_label_only["score"]:
+                best_label_only = label_only
+            estimate = self.estimate_goal_from_bbox(observations, prediction.bbox[idx])
+            if estimate is None:
+                continue
+            goal_gps, distance, direction = estimate
+            delta = float(np.linalg.norm(goal_gps - target_gps))
+            if delta < best_delta:
+                best_delta = delta
+                best = {
+                    "label": str(label),
+                    "score": score,
+                    "distance": float(distance),
+                    "delta": delta,
+                    "direction": float(direction),
+                    "gps": np.asarray(goal_gps, dtype=np.float32).tolist(),
+                    "depth_valid": True,
+                }
+
+        if best is None:
+            best = best_label_only
+        node_support = self.get_goal_node_support(target_gps)
+        hit = (
+            best is not None
+            and best["depth_valid"]
+            and best["delta"] <= self.stop_verification_same_goal_radius_m
+            and best["distance"] <= self.stop_verification_max_detection_distance_m
+            and node_support["supported"]
+        )
+        if hit:
+            self.stop_verification_hits += 1
+            self.scenegraph.debug_stats.inc("stop_verification_hit")
+        else:
+            self.scenegraph.debug_stats.inc("stop_verification_miss")
+
+        self.stop_verification_history.append({
+            "step": int(self.total_steps),
+            "hit": bool(hit),
+            "hits": int(self.stop_verification_hits),
+            "steps_taken": int(self.stop_verification_steps_taken + 1),
+            "best_detection": best,
+            "goal_node_support": node_support,
+        })
+        return hit, best, node_support
+
+    def get_distance_to_stop_target(self, observations):
+        if self.stop_verification_target_gps is None:
+            return float("inf")
+        agent_gps = np.asarray(observations["gps"], dtype=np.float32)
+        target_gps = np.asarray(self.stop_verification_target_gps, dtype=np.float32)
+        return float(np.linalg.norm(agent_gps - target_gps))
+
+    def get_direct_goal_approach_action(self, best_detection, node_support, target_distance):
+        if not self.direct_goal_approach_enabled:
+            return None
+        if best_detection is None or not node_support["supported"]:
+            return None
+        if not best_detection.get("depth_valid", False):
+            return None
+        if best_detection["delta"] > self.stop_verification_same_goal_radius_m:
+            return None
+        if best_detection["distance"] > self.direct_goal_approach_max_detection_distance_m:
+            return None
+        if target_distance <= self.direct_goal_approach_min_distance_m:
+            return None
+
+        direction = best_detection["direction"]
+        if direction > self.direct_goal_approach_turn_threshold_deg:
+            return 3
+        if direction < -self.direct_goal_approach_turn_threshold_deg:
+            return 2
+        return 1
+
+    def reject_confirmed_goal(self, reason):
+        if getattr(self, "goal_gps", None) is not None:
+            self.rejected_goal_candidates.append({
+                "gps": np.asarray(self.goal_gps, dtype=np.float32).copy(),
+                "step": int(self.total_steps),
+                "reason": reason,
+            })
+        self.found_goal = False
+        self.found_possible_goal = False
+        self.found_goal_times = 0
+        self.goal_gps_map.fill(0)
+        self.reperception_active = False
+        self.reperception_goal_gps = None
+        self.reperception_goal_map_xy = None
+        self.reperception_source = ""
+        self.reperception_score_sum = 0.0
+        self.reperception_steps = 0
+        self.reperception_observation_count = 0
+        self.scenegraph.debug_stats.inc("stop_verification_rejected_goal")
+
+    def handle_stop_verification(self, observations):
+        if self.stop_verification_steps == 0:
+            return True, 0
+        if not self.stop_verification_active:
+            self.stop_verification_active = True
+            self.stop_verification_target_gps = np.asarray(
+                self.goal_gps, dtype=np.float32
+            ).copy()
+            self.stop_verification_steps_taken = 0
+            self.stop_verification_hits = 0
+            self.stop_verification_consecutive_failures = 0
+            self.scenegraph.debug_stats.inc("stop_verification_started")
+
+        hit, best_detection, node_support = self.observe_stop_verification(observations)
+        if hit and best_detection is not None:
+            self.stop_verification_consecutive_failures = 0
+            self.stop_verification_target_gps = np.asarray(
+                best_detection["gps"],
+                dtype=np.float32,
+            )
+            self.goal_gps = self.stop_verification_target_gps.copy()
+            node_support = self.get_goal_node_support(self.stop_verification_target_gps)
+        target_distance = self.get_distance_to_stop_target(observations)
+        if self.stop_verification_history:
+            self.stop_verification_history[-1]["target_distance"] = target_distance
+            self.stop_verification_history[-1]["updated_target_gps"] = (
+                np.asarray(self.stop_verification_target_gps, dtype=np.float32).tolist()
+            )
+            self.stop_verification_history[-1]["goal_node_support"] = node_support
+
+        approach_action = self.get_direct_goal_approach_action(
+            best_detection,
+            node_support,
+            target_distance,
+        )
+        if approach_action is not None:
+            if self.direct_goal_approach_steps >= self.direct_goal_approach_max_steps:
+                self.stop_reason = "direct_goal_approach_rejected"
+                self.reject_confirmed_goal(reason="direct_goal_approach_timeout")
+                self.reset_stop_verification_state(clear_history=False)
+                return False, self.stop_verification_turn_action
+            self.direct_goal_approach_steps += 1
+            self.stop_verification_consecutive_failures = 0
+            self.stop_reason = "direct_goal_approach"
+            self.scenegraph.debug_stats.inc("direct_goal_approach")
+            return False, approach_action
+
+        self.stop_verification_steps_taken += 1
+
+        final_detection_seen = (
+            best_detection is not None
+            and node_support["supported"]
+            and (
+                not best_detection.get("depth_valid", False)
+                or best_detection["delta"] <= self.stop_verification_same_goal_radius_m
+            )
+        )
+        close_to_target = target_distance <= self.direct_goal_approach_min_distance_m
+        enough_hits = self.stop_verification_hits >= self.stop_verification_min_hits
+        if (
+            self.direct_goal_approach_enabled
+            and close_to_target
+            and final_detection_seen
+            and self.stop_verification_hits >= max(0, self.stop_verification_min_hits - 1)
+        ):
+            enough_hits = True
+
+        if enough_hits:
+            close_enough = (
+                not self.direct_goal_approach_enabled
+                or (final_detection_seen and close_to_target)
+            )
+            if close_enough:
+                self.stop_reason = "stop_verification_confirmed"
+                self.scenegraph.debug_stats.inc("stop_verification_confirmed")
+                self.reset_stop_verification_state(clear_history=False)
+                return True, 0
+
+        if final_detection_seen:
+            self.stop_verification_consecutive_failures = 0
+        else:
+            self.stop_verification_consecutive_failures += 1
+
+        if self.stop_verification_consecutive_failures >= self.stop_verification_steps:
+            self.stop_reason = "stop_verification_rejected"
+            self.reject_confirmed_goal(reason="stop_verification_failed")
+            self.reset_stop_verification_state(clear_history=False)
+            return False, self.stop_verification_turn_action
+
+        self.stop_reason = "stop_verification_scanning"
+        return False, self.stop_verification_turn_action
         
     def detect_objects(self, observations):
         self.current_obj_predictions = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], object_captions) # GLIP object detection, time cosuming
@@ -495,12 +846,7 @@ class SG_Nav_Agent():
         goal_detections = []
         for j, label in enumerate(obj_labels):
             score = self.confidence_to_float(obj_scores[j])
-            if self.obj_goal in label:
-                goal_detections.append({
-                    "bbox": self.current_obj_predictions.bbox[j],
-                    "score": score,
-                })
-            elif self.obj_goal == 'gym_equipment' and (label in ['treadmill', 'exercise machine']):
+            if self.goal_label_matches(label):
                 goal_detections.append({
                     "bbox": self.current_obj_predictions.bbox[j],
                     "score": score,
@@ -587,7 +933,7 @@ class SG_Nav_Agent():
                     # if detected a long goal before, then don't change it until see a goal within 5 meters
                     self.possible_goal_temp_gps = self.get_goal_gps(observations, shortest_distance_angle, shortest_distance)
             else:
-                if self.found_goal:
+                if self.found_goal and not self.stop_verification_active:
                     self.found_goal = False
                     self.found_goal_times = 0
             self.tick_reperception_without_observation("groundedsam_mask_missing")
@@ -772,6 +1118,7 @@ class SG_Nav_Agent():
             if self.not_move_steps >= 7:
                 self.found_goal = False
                 self.found_possible_goal = False
+                self.reset_stop_verification_state(clear_history=False)
             self.loop_time += 1
             self.random_this_ex += 1
             if self.loop_time > 20:
@@ -782,13 +1129,38 @@ class SG_Nav_Agent():
             self.using_random_goal = True
             stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
         
+        verification_should_run = (
+            (self.stop_verification_active and self.stop_verification_target_gps is not None)
+            or (number_action == 0 and self.found_goal)
+        )
+        verification_ran = False
+        if verification_should_run:
+            verification_ran = True
+            verified_stop, verification_action = self.handle_stop_verification(observations)
+            if not verified_stop:
+                number_action = verification_action
+                if verification_action in [2, 3]:
+                    self.not_move_steps = 0
+                if (
+                    self.stop_verification_active
+                    and self.stop_verification_target_gps is not None
+                ):
+                    self.found_goal = True
+                    self.found_possible_goal = False
+                    self.goal_gps = np.asarray(
+                        self.stop_verification_target_gps,
+                        dtype=np.float32,
+                    ).copy()
+
         if number_action == 0:
             if self.found_goal:
-                self.stop_reason = 'planner_stop_after_found_goal'
+                if not self.stop_reason.startswith("stop_verification_confirmed"):
+                    self.stop_reason = 'planner_stop_after_found_goal'
             else:
                 self.stop_reason = 'planner_stop_without_confirmed_goal'
         else:
-            self.stop_reason = 'running'
+            if not verification_ran:
+                self.stop_reason = 'running'
         if self.args.visualize:
             self.update_visualization_text(number_action)
             self.visualize(traversible, observations, number_action)
@@ -1142,6 +1514,27 @@ class SG_Nav_Agent():
             "reperception_threshold": float(self.reperception_threshold),
             "reperception_score_sum": float(self.reperception_score_sum),
             "found_goal_stop_distance_m": float(self.found_goal_stop_distance_m),
+            "stop_verification_steps": int(self.stop_verification_steps),
+            "stop_verification_min_hits": int(self.stop_verification_min_hits),
+            "stop_verification_same_goal_radius_m": float(
+                self.stop_verification_same_goal_radius_m
+            ),
+            "stop_verification_max_detection_distance_m": float(
+                self.stop_verification_max_detection_distance_m
+            ),
+            "stop_verification_goal_node_radius_m": float(
+                self.stop_verification_goal_node_radius_m
+            ),
+            "direct_goal_approach_enabled": bool(self.direct_goal_approach_enabled),
+            "direct_goal_approach_min_distance_m": float(
+                self.direct_goal_approach_min_distance_m
+            ),
+            "direct_goal_approach_steps": int(self.direct_goal_approach_steps),
+            "direct_goal_approach_max_steps": int(self.direct_goal_approach_max_steps),
+            "stop_verification_consecutive_failures": int(
+                self.stop_verification_consecutive_failures
+            ),
+            "stop_verification_history": self.stop_verification_history[-10:],
             "reperception_rejected_count": len(self.rejected_goal_candidates),
             "reperception_history": self.reperception_history[-10:],
             "llm_parse_failures": self.scenegraph.debug_stats.summary(),
@@ -1278,16 +1671,55 @@ def main():
         "--rejected_goal_ttl", default=80, type=int
     )
     parser.add_argument(
-        "--found_goal_stop_distance_m", default=0.35, type=float
+        "--found_goal_stop_distance_m", default=0.30, type=float
+    )
+    parser.add_argument(
+        "--stop_verification_steps", default=4, type=int
+    )
+    parser.add_argument(
+        "--stop_verification_min_hits", default=2, type=int
+    )
+    parser.add_argument(
+        "--stop_verification_same_goal_radius_m", default=1.0, type=float
+    )
+    parser.add_argument(
+        "--stop_verification_max_detection_distance_m", default=2.5, type=float
+    )
+    parser.add_argument(
+        "--stop_verification_goal_node_radius_m", default=2.0, type=float
+    )
+    parser.add_argument(
+        "--stop_verification_turn_action", default=3, type=int
+    )
+    parser.add_argument(
+        "--direct_goal_approach_enabled", default=1, type=int
+    )
+    parser.add_argument(
+        "--direct_goal_approach_min_distance_m", default=0.35, type=float
+    )
+    parser.add_argument(
+        "--direct_goal_approach_turn_threshold_deg", default=20.0, type=float
+    )
+    parser.add_argument(
+        "--direct_goal_approach_max_detection_distance_m", default=4.5, type=float
+    )
+    parser.add_argument(
+        "--direct_goal_approach_max_steps", default=20, type=int
     )
     args = parser.parse_args()
+    startup_log(f"args parsed split=[{args.split_l}:{args.split_r}] num_episodes={args.num_episodes}")
     os.environ["CHALLENGE_CONFIG_FILE"] = args.config
     config_paths = os.environ["CHALLENGE_CONFIG_FILE"]
+    startup_log(f"habitat config load begin config={config_paths}")
     config = habitat.get_config(config_paths)
+    startup_log("habitat config load done")
     agent = SG_Nav_Agent(task_config=config, args=args)
 
+    startup_log("habitat challenge init begin")
     challenge = habitat.Challenge(eval_remote=False, split_l=args.split_l, split_r=args.split_r)
+    startup_log("habitat challenge init done")
 
+    startup_log("challenge submit begin")
     challenge.submit(agent, num_episodes=args.num_episodes)
 
 

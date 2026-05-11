@@ -21,10 +21,22 @@ cd /home/echo/SG-Nav
 ./docker/build_image.sh
 ```
 
-If the default CUDA base image is not available on your server, override it:
+If your current shell has not picked up Docker group membership yet, prefix helper scripts with:
 
 ```bash
-CUDA_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04 ./docker/build_image.sh
+DOCKER_BIN="sudo docker" ./docker/build_image.sh
+```
+
+If you build with a custom Docker daemon that has no bridge network, add:
+
+```bash
+BUILD_NETWORK=host DOCKER_BIN="sudo docker -H unix:///path/to/docker.sock" ./docker/build_image.sh
+```
+
+The default base image is pulled from NVIDIA NGC (`nvcr.io`) because Docker Hub can be slow or rate-limited. It uses the smaller CUDA `base` image because the bundled `.mamba` environments already carry the Python-side CUDA/cuDNN libraries. If that image is not available on your server, override it:
+
+```bash
+CUDA_IMAGE=nvidia/cuda:12.8.1-base-ubuntu22.04 ./docker/build_image.sh
 ```
 
 ## Export For Transfer

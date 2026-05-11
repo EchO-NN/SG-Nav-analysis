@@ -30,6 +30,7 @@ fi
 
 export HF_HOME="${HF_HOME:-$ROOT_DIR/.cache/huggingface}"
 export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
+export PATH="$VLLM_ENV/bin:${PATH:-}"
 export LD_LIBRARY_PATH="$VLLM_ENV/lib:${LD_LIBRARY_PATH:-}"
 
 exec "$VLLM_ENV/bin/vllm" serve "$MODEL" \

@@ -214,7 +214,12 @@ class SceneGraph():
         self.camera_matrix = camera_matrix
         self.SAM_ENCODER_VERSION = "vit_h"
         self.sam_variant = 'groundedsam'
-        self.device = 'cuda'
+        self.force_cpu = os.environ.get("SGNAV_FORCE_CPU", "0") not in [
+            "0",
+            "false",
+            "False",
+        ]
+        self.device = 'cpu' if self.force_cpu else 'cuda'
         self.classes = ['item']
         self.BG_CLASSES = ["wall", "floor", "ceiling"]
         self.rooms = ['bedroom', 'living room', 'bathroom', 'kitchen', 'dining room', 'office room', 'gym', 'lounge', 'laundry room']
@@ -305,7 +310,7 @@ Final probability:'''
         self._wall_orientation_cache = {}
 
     def set_cfg(self):
-        cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': 'cuda', 'use_iou': True, 'spatial_sim_type': 'overlap', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.025, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 10, 'obj_min_points': 0, 'obj_min_detections': 3, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
+        cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': self.device, 'use_iou': True, 'spatial_sim_type': 'overlap', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.025, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 10, 'obj_min_points': 0, 'obj_min_detections': 3, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
         cfg = DictConfig(cfg)
         if self.is_navigation:
             cfg.sim_threshold = 0.8
@@ -517,13 +522,13 @@ Final probability:'''
             cropped_image = image.crop((x_min, y_min, x_max, y_max))
             
             # Get the preprocessed image for clip from the crop 
-            preprocessed_image = clip_preprocess(cropped_image).unsqueeze(0).to("cuda")
+            preprocessed_image = clip_preprocess(cropped_image).unsqueeze(0).to(device)
 
             crop_feat = clip_model.encode_image(preprocessed_image)
             crop_feat /= crop_feat.norm(dim=-1, keepdim=True)
             
             class_id = detections.class_id[idx]
-            tokenized_text = clip_tokenizer([classes[class_id]]).to("cuda")
+            tokenized_text = clip_tokenizer([classes[class_id]]).to(device)
             text_feat = clip_model.encode_text(tokenized_text)
             text_feat /= text_feat.norm(dim=-1, keepdim=True)
             

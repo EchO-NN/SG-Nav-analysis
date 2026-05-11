@@ -1,0 +1,10 @@
+{'distance_to_goal': 9.177970886230469, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 1.9866164922714233, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 2.40497088432312, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 2.706139087677002, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 11.047687530517578, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 2.8097968101501465, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 7.956299304962158, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 7.3497538566589355, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 2.740577459335327, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}
+{'distance_to_goal': 11.749780654907227, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0}

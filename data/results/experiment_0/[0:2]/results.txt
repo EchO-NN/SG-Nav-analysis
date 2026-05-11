@@ -1,0 +1,10 @@
+{'distance_to_goal': 1.1655396223068237, 'success': 0.0, 'spl': 0.0, 'softspl': 0.13666328442728365, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 13.404424667358398, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 0.046554140746593475, 'success': 0.0, 'spl': 0.0, 'softspl': 0.07256935767921881, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 4.8717427253723145, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 2.2897610664367676, 'success': 0.0, 'spl': 0.0, 'softspl': 0.13398181731182385, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 3.895984649658203, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 3.3544154167175293, 'success': 0.0, 'spl': 0.0, 'softspl': 0.06000078732476626, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 8.461082458496094, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 3.066420078277588, 'success': 0.0, 'spl': 0.0, 'softspl': 0.0, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}
+{'distance_to_goal': 2.2407495975494385, 'success': 0.0, 'spl': 0.0, 'softspl': 0.12684123949501375, 'goal': 'cabinet', 'steps': 500, 'stop_reason': 'running'}

@@ -4,10 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_NAME="${IMAGE_NAME:-sgnav-pro6000:latest}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/docker_outputs}"
+read -r -a DOCKER_CMD <<< "${DOCKER_BIN:-docker}"
 
 mkdir -p "$OUT_DIR/results" "$OUT_DIR/debug_sgnav" "$OUT_DIR/visualization"
 
-docker run \
+"${DOCKER_CMD[@]}" run \
   --gpus all \
   --ipc=host \
   --shm-size=16g \

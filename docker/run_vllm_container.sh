@@ -3,8 +3,9 @@ set -euo pipefail
 
 IMAGE_NAME="${IMAGE_NAME:-sgnav-pro6000:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-sgnav-vllm}"
+read -r -a DOCKER_CMD <<< "${DOCKER_BIN:-docker}"
 
-docker run \
+"${DOCKER_CMD[@]}" run \
   --gpus all \
   --ipc=host \
   --shm-size=16g \

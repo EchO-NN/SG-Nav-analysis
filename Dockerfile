@@ -1,4 +1,4 @@
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda:12.8.1-base-ubuntu22.04
 FROM ${CUDA_IMAGE}
 
 ARG UID=1000
@@ -45,7 +45,7 @@ RUN mkdir -p \
     /home/echo/SG-Nav/data/visualization \
     /home/echo/SG-Nav/.cache/matplotlib \
     /home/echo/SG-Nav/.cache/torch \
-    && ln -sfn ../MatterPort3D /home/echo/SG-Nav/data/MatterPort3D \
+    && ln -sfnT ../MatterPort3D /home/echo/SG-Nav/data/MatterPort3D \
     && chmod +x \
     /home/echo/SG-Nav/run_sg_nav.sh \
     /home/echo/SG-Nav/run_vllm.sh \

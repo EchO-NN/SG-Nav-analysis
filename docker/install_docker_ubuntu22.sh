@@ -21,6 +21,7 @@ fi
 
 DOCKER_APT_MIRROR="${DOCKER_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/ubuntu}"
 DOCKER_GPG_URL="${DOCKER_GPG_URL:-${DOCKER_APT_MIRROR}/gpg}"
+INSTALL_NVIDIA_TOOLKIT="${INSTALL_NVIDIA_TOOLKIT:-1}"
 
 rm -f /etc/apt/sources.list.d/docker.list
 
@@ -55,26 +56,32 @@ if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
   usermod -aG docker "${SUDO_USER}"
 fi
 
-apt-get install -y --no-install-recommends \
-  ca-certificates \
-  curl \
-  gnupg2
+if [[ "${INSTALL_NVIDIA_TOOLKIT}" == "1" ]]; then
+  apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg2
 
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-  | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    > /etc/apt/sources.list.d/nvidia-container-toolkit.list
 
-apt-get update
-apt-get install -y nvidia-container-toolkit
+  apt-get update
+  apt-get install -y nvidia-container-toolkit
 
-nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
+  nvidia-ctk runtime configure --runtime=docker
+  systemctl restart docker
+fi
 
 docker --version
 docker compose version
-nvidia-ctk --version
+if command -v nvidia-ctk >/dev/null 2>&1; then
+  nvidia-ctk --version
+fi
 
 echo
 echo "Docker installation finished."
@@ -83,5 +90,9 @@ if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
   echo "Log out and back in, or run: newgrp docker"
 fi
 echo
-echo "If NVIDIA drivers are installed and loaded, test GPU containers with:"
-echo "  docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi"
+if [[ "${INSTALL_NVIDIA_TOOLKIT}" == "1" ]]; then
+  echo "If NVIDIA drivers are installed and loaded, test GPU containers with:"
+  echo "  docker run --rm --gpus all nvcr.io/nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi"
+else
+  echo "NVIDIA Container Toolkit was skipped. Install it before running with --gpus all."
+fi

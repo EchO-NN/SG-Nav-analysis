@@ -4,6 +4,8 @@ glip_large_model.pth
 /MatterPort3D
 /.cache
 /.mamba
+/.docker-build
+/dist
 /GLIP/build
 /GLIP/maskrcnn_benchmark.egg-info
 /segment_anything/segment_anything.egg-info/

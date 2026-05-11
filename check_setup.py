@@ -28,12 +28,18 @@ def run(cmd, timeout=20, env_lib=None):
     env = os.environ.copy()
     env["NLTK_DATA"] = str(ROOT / ".cache/nltk_data")
     env["HF_HOME"] = str(ROOT / ".cache/huggingface")
-    env["PYTHONPATH"] = f"{ROOT / 'GLIP'}:{env.get('PYTHONPATH', '')}".rstrip(":")
+    env["PYTHONPATH"] = (
+        f"{ROOT / 'habitat-lab'}:{ROOT / 'GroundingDINO'}:"
+        f"{ROOT / 'GLIP'}:{ROOT}:{env.get('PYTHONPATH', '')}"
+    ).rstrip(":")
     lib_paths = [
         ROOT / ".mamba/envs/sg-nav/lib/python3.9/site-packages/torch/lib",
         ROOT / ".mamba/envs/sg-nav/lib",
     ]
     cuda12_runtime = Path("/usr/local/lib/ollama/cuda_v12")
+    portable_cuda12_runtime = ROOT / ".cuda_v12"
+    if portable_cuda12_runtime.exists():
+        lib_paths.insert(0, portable_cuda12_runtime)
     if cuda12_runtime.exists():
         lib_paths.insert(0, cuda12_runtime)
     if env_lib:

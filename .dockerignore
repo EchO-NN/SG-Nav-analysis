@@ -27,3 +27,4 @@ segment_anything/*.egg-info/
 
 docker_outputs/
 dist/
+.docker-build/
