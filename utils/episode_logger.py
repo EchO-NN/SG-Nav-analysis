@@ -15,6 +15,7 @@ class EpisodeLogger:
     def log(self, row):
         self.rows.append(row)
         if self.enabled:
+            os.makedirs(self.log_dir, exist_ok=True)
             with open(self.path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
         self.print_summary(row)

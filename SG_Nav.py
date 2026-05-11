@@ -20,6 +20,7 @@ from pslpython.rule import Rule
 
 from scenegraph import SceneGraph
 from utils.episode_logger import EpisodeLogger
+from utils.fbe_trace_logger import FBETraceLogger
 
 import utils.utils_fmm.control_helper as CH
 import utils.utils_fmm.pose_utils as pu
@@ -91,10 +92,26 @@ class SG_Nav_Agent():
         self.loop_time = 0
         self.last_segment_num = 0
         self.goal_merge_threshold = 0.8
+        self.max_episode_steps = 500
+        self.paper_reperception_mode = bool(
+            getattr(self.args, "paper_reperception_mode", False)
+        )
+        self.disable_extra_stop_verification = bool(
+            getattr(self.args, "disable_extra_stop_verification", False)
+        )
+        self.stop_liveness_last_steps = max(
+            0, int(getattr(self.args, "stop_liveness_last_steps", 5))
+        )
         self.reperception_max_steps = int(getattr(self.args, "reperception_max_steps", 10))
         self.reperception_threshold = float(getattr(self.args, "reperception_threshold", 0.8))
+        if self.paper_reperception_mode:
+            self.reperception_max_steps = 10
+            self.reperception_threshold = 0.8
         self.reperception_min_observations = max(
             1, int(getattr(self.args, "reperception_min_observations", 3))
+        )
+        self.reperception_score_norm = getattr(
+            self.args, "reperception_score_norm", "weighted_mean"
         )
         self.reperception_min_dist_m = float(getattr(self.args, "reperception_min_dist_m", 0.25))
         self.reperception_same_goal_radius_m = float(
@@ -210,6 +227,13 @@ class SG_Nav_Agent():
             log_dir=self.debug_sgnav_dir,
             enabled=self.debug_sgnav,
         )
+        self.debug_fbe_trace = bool(getattr(self.args, "debug_fbe_trace", False))
+        self.fbe_trace_logger = FBETraceLogger(
+            enabled=self.debug_fbe_trace,
+            log_dir=getattr(self.args, "fbe_trace_dir", "data/debug_fbe"),
+        )
+        self.random_goal_reasons = []
+        self.fbe_frontier_count_valid_history = []
         self.episode_logged = False
 
         self.experiment_name = 'experiment_0'
@@ -276,6 +300,7 @@ class SG_Nav_Agent():
         self.history_pose = []
         self.visualize_image_list = []
         self.count_episodes = self.count_episodes + 1
+        self.fbe_trace_logger.start_episode(self.count_episodes)
         self.loop_time = 0
         self.last_segment_num = 0
         self.metrics = {'distance_to_goal': 0., 'spl': 0., 'softspl': 0.}
@@ -294,6 +319,8 @@ class SG_Nav_Agent():
         self.using_random_goal = False
         self.fronter_this_ex = 0
         self.random_this_ex = 0
+        self.random_goal_reasons = []
+        self.fbe_frontier_count_valid_history = []
         self.last_location = np.array([0.,0.])
         self.current_stuck_steps = 0
         self.total_stuck_steps = 0
@@ -328,6 +355,8 @@ class SG_Nav_Agent():
         self.reperception_last_step = -1
         self.reperception_history = []
         self.rejected_goal_candidates = []
+        self.last_reperception_score_graph = 0.0
+        self.last_stop_liveness_decision = {}
 
     def goal_gps_to_map_xy(self, goal_gps):
         """Return map pixel [x, y] in the same convention as SceneGraph node.center."""
@@ -337,6 +366,122 @@ class SG_Nav_Agent():
         x = min(max(x, 0), self.map_size - 1)
         y = min(max(y, 0), self.map_size - 1)
         return np.array([x, y], dtype=np.float32)
+
+    def goal_gps_to_map_rc(self, goal_gps):
+        """Return map pixel [row, col] for arrays indexed as map[row, col]."""
+        xy = self.goal_gps_to_map_xy(goal_gps)
+        return np.array([xy[1], xy[0]], dtype=np.float32)
+
+    def distance_to_gps(self, candidate_gps, observations=None):
+        candidate_gps = np.asarray(candidate_gps, dtype=np.float32)
+        if observations is None:
+            observations = getattr(self, "current_observations", None)
+        if observations is not None and "gps" in observations:
+            agent_gps = np.asarray(observations["gps"], dtype=np.float32)
+        elif getattr(self, "last_gps", None) is not None and np.all(np.isfinite(self.last_gps)):
+            agent_gps = np.asarray(self.last_gps, dtype=np.float32)
+        else:
+            full_pose = self.full_pose.detach().cpu().numpy() if torch.is_tensor(self.full_pose) else np.asarray(self.full_pose)
+            center_m = self.map_size_cm / 100.0 / 2.0
+            agent_gps = np.array([full_pose[0] - center_m, center_m - full_pose[1]], dtype=np.float32)
+        return float(np.linalg.norm(agent_gps - candidate_gps))
+
+    def get_stop_liveness_candidate_gps(self):
+        if getattr(self, "found_goal", False) and getattr(self, "goal_gps", None) is not None:
+            return np.asarray(self.goal_gps, dtype=np.float32), "confirmed_goal"
+        if (
+            getattr(self, "reperception_active", False)
+            and getattr(self, "reperception_goal_gps", None) is not None
+        ):
+            return np.asarray(self.reperception_goal_gps, dtype=np.float32), "active_reperception"
+        if (
+            getattr(self, "found_possible_goal", False)
+            and getattr(self, "possible_goal_temp_gps", None) is not None
+        ):
+            return np.asarray(self.possible_goal_temp_gps, dtype=np.float32), "possible_goal"
+        return None, ""
+
+    def should_stop_near_candidate_goal(self):
+        """Liveness guard for credible nearby goal candidates."""
+        candidate_gps, source = self.get_stop_liveness_candidate_gps()
+        if candidate_gps is None or not np.all(np.isfinite(candidate_gps)):
+            self.last_stop_liveness_decision = {"should_stop": False, "reason": "no_candidate"}
+            return False
+
+        dist_m = self.distance_to_gps(candidate_gps)
+        if dist_m > self.found_goal_stop_distance_m:
+            self.last_stop_liveness_decision = {
+                "should_stop": False,
+                "reason": "candidate_not_close",
+                "source": source,
+                "distance_m": dist_m,
+            }
+            return False
+
+        score_ready = self.reperception_score_sum >= self.reperception_threshold
+        node_support = self.get_goal_node_support(candidate_gps)
+        node_supported = bool(node_support.get("supported", False))
+        verification_hits_supported = (
+            getattr(self, "stop_verification_hits", 0)
+            >= max(1, self.stop_verification_min_hits - 1)
+        )
+        detector_supported = (
+            verification_hits_supported
+            or (
+                source == "active_reperception"
+                and self.reperception_observation_count > 0
+                and score_ready
+            )
+            or (
+                source == "possible_goal"
+                and self.found_goal_times >= self.reperception_threshold
+            )
+        )
+        last_step_override = (
+            self.stop_liveness_last_steps > 0
+            and self.total_steps >= self.max_episode_steps - self.stop_liveness_last_steps
+            and (score_ready or detector_supported or node_supported)
+        )
+        credible = bool(
+            self.found_goal
+            or (score_ready and (node_supported or detector_supported))
+            or verification_hits_supported
+            or last_step_override
+        )
+        self.last_stop_liveness_decision = {
+            "should_stop": credible,
+            "reason": "near_credible_goal_candidate" if credible else "candidate_not_credible",
+            "source": source,
+            "candidate_gps": candidate_gps.tolist(),
+            "distance_m": dist_m,
+            "score_ready": bool(score_ready),
+            "score_sum": float(self.reperception_score_sum),
+            "node_support": node_support,
+            "detector_supported": bool(detector_supported),
+            "verification_hits": int(getattr(self, "stop_verification_hits", 0)),
+            "last_step_override": bool(last_step_override),
+        }
+        if credible:
+            self.scenegraph.debug_stats.inc("stop_liveness_guard")
+            self.scenegraph.debug_stats.inc("near_credible_goal_candidate")
+        return credible
+
+    def apply_stop_liveness_guard(self):
+        if self.disable_extra_stop_verification:
+            return False
+        if not self.should_stop_near_candidate_goal():
+            return False
+        candidate_gps = np.asarray(
+            self.last_stop_liveness_decision.get("candidate_gps"),
+            dtype=np.float32,
+        )
+        if candidate_gps.size == 2 and np.all(np.isfinite(candidate_gps)):
+            self.goal_gps = candidate_gps.copy()
+        self.found_goal = True
+        self.found_possible_goal = False
+        self.reperception_active = False
+        self.stop_reason = "near_credible_goal_candidate"
+        return True
 
     def confidence_to_float(self, confidence, default=0.5):
         if confidence is None:
@@ -373,14 +518,17 @@ class SG_Nav_Agent():
         goal_xy = self.goal_gps_to_map_xy(goal_gps)
         subgraphs = self.scenegraph.get_scored_subgraphs_for_goal(self.obj_goal_sg)
         score_graph = 0.0
+        weight_sum = 0.0
         contributions = []
         for subgraph in subgraphs:
             center_xy = np.asarray(subgraph["center_xy"], dtype=np.float32)
             dist_pix = float(np.linalg.norm(center_xy - goal_xy))
             dist_m = max(dist_pix * self.map_resolution / 100.0, self.reperception_min_dist_m)
             p_sub = float(np.clip(subgraph["score"], 0.0, 1.0))
-            term = p_sub / dist_m
+            weight = 1.0 / dist_m
+            term = p_sub * weight
             score_graph += term
+            weight_sum += weight
             center_node = subgraph.get("center_node")
             contributions.append({
                 "center": center_xy.tolist(),
@@ -388,8 +536,12 @@ class SG_Nav_Agent():
                 "room": subgraph.get("room", ""),
                 "p_sub": p_sub,
                 "dist_m": dist_m,
+                "weight": weight,
                 "term": term,
             })
+        if self.reperception_score_norm == "weighted_mean":
+            score_graph = score_graph / max(weight_sum, 1e-6)
+        self.last_reperception_score_graph = float(score_graph)
         score_k = float(confidence) * float(score_graph)
         return score_k, contributions
 
@@ -455,6 +607,8 @@ class SG_Nav_Agent():
             "confidence": confidence,
             "score_k": float(score_k),
             "score_sum": float(self.reperception_score_sum),
+            "score_graph": float(self.last_reperception_score_graph),
+            "score_norm": self.reperception_score_norm,
             "observation_count": int(self.reperception_observation_count),
             "num_subgraphs": len(contributions),
             "top_contributions": top_contributions,
@@ -464,8 +618,11 @@ class SG_Nav_Agent():
         self.scenegraph.debug_stats.inc("reperception_observations")
 
         score_ready = self.reperception_score_sum >= self.reperception_threshold
-        enough_observations = self.reperception_observation_count >= self.reperception_min_observations
-        if score_ready and enough_observations and self.reperception_steps < self.reperception_max_steps:
+        enough_observations = (
+            self.paper_reperception_mode
+            or self.reperception_observation_count >= self.reperception_min_observations
+        )
+        if score_ready and enough_observations:
             history_item["status"] = "confirmed"
             self.confirm_reperception_goal()
             return "confirmed"
@@ -528,6 +685,8 @@ class SG_Nav_Agent():
         self.found_goal_times = self.reperception_score_sum
         self.reperception_active = False
         self.scenegraph.debug_stats.inc("reperception_confirmed")
+        if self.paper_reperception_mode:
+            self.scenegraph.debug_stats.inc("paper_reperception_confirmed")
 
     def reject_reperception_goal(self, reason):
         if self.reperception_goal_gps is not None:
@@ -742,6 +901,45 @@ class SG_Nav_Agent():
         self.scenegraph.debug_stats.inc("stop_verification_rejected_goal")
 
     def handle_stop_verification(self, observations):
+        if self.disable_extra_stop_verification:
+            self.scenegraph.debug_stats.inc("extra_stop_verification_disabled")
+            candidate_gps, source = self.get_stop_liveness_candidate_gps()
+            if candidate_gps is None:
+                self.last_stop_liveness_decision = {
+                    "should_stop": False,
+                    "reason": "no_candidate",
+                }
+                self.stop_reason = "stop_without_candidate_rejected"
+                self.reject_confirmed_goal(reason=self.stop_reason)
+                self.reset_stop_verification_state(clear_history=False)
+                return False, self.stop_verification_turn_action
+
+            self.stop_verification_target_gps = np.asarray(
+                candidate_gps, dtype=np.float32
+            ).copy()
+            self.stop_verification_steps_taken = 0
+            self.stop_verification_hits = 0
+            hit, best_detection, node_support = self.observe_stop_verification(observations)
+
+            if hit and self.should_stop_near_candidate_goal():
+                return True, 0
+            self.last_stop_liveness_decision = {
+                "should_stop": False,
+                "reason": "stop_without_current_detector_support",
+                "source": source,
+                "candidate_gps": np.asarray(candidate_gps, dtype=np.float32).tolist(),
+                "current_detector_hit": bool(hit),
+                "best_detection": best_detection,
+                "node_support": node_support,
+            }
+            self.scenegraph.debug_stats.inc("stop_without_current_detector_rejected")
+            self.stop_reason = self.last_stop_liveness_decision.get(
+                "reason",
+                "stop_without_verification_rejected",
+            )
+            self.reject_confirmed_goal(reason=self.stop_reason)
+            self.reset_stop_verification_state(clear_history=False)
+            return False, self.stop_verification_turn_action
         if self.stop_verification_steps == 0:
             return True, 0
         if not self.stop_verification_active:
@@ -862,9 +1060,11 @@ class SG_Nav_Agent():
                 if temp_distance >= self.distance_threshold:
                     continue
                 obj_gps = self.get_goal_gps(observations, temp_direction, temp_distance)
-                x = int(self.map_size_cm/10-obj_gps[1]*100/self.resolution)
-                y = int(self.map_size_cm/10+obj_gps[0]*100/self.resolution)
-                self.obj_locations[categories_21_origin.index(label)].append([confidence, x, y])
+                obj_row = int(self.map_size_cm / 10 - obj_gps[1] * 100 / self.resolution)
+                obj_col = int(self.map_size_cm / 10 + obj_gps[0] * 100 / self.resolution)
+                self.obj_locations[categories_21_origin.index(label)].append(
+                    [confidence, obj_row, obj_col]
+                )
         
         if self.scenegraph.obj_goal in self.scenegraph.small_objects:
             self.segment_num = len(self.scenegraph.segment2d_results)
@@ -987,7 +1187,8 @@ class SG_Nav_Agent():
             return
                         
     def act(self, observations):
-        if self.total_steps >= 500:
+        self.current_observations = observations
+        if self.total_steps >= self.max_episode_steps:
             self.stop_reason = 'max_episode_steps'
             return {"action": 0}
         
@@ -1040,6 +1241,8 @@ class SG_Nav_Agent():
             self.detect_objects(observations)
             room_detection_result = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], rooms_captions)
             self.update_room_map(observations, room_detection_result)
+            if self.apply_stop_liveness_guard():
+                return {"action": 0}
             if not self.found_goal: # if found a goal, directly go to it
                 return {"action": 6}
                     
@@ -1079,7 +1282,8 @@ class SG_Nav_Agent():
             self.goal_map = np.zeros(self.full_map.shape[-2:])
             if self.goal_loc is None:
                 self.random_this_ex += 1
-                self.goal_map = self.set_random_goal()
+                self.record_random_goal("fbe_no_valid_goal_initial")
+                self.goal_map = self.set_random_goal(reason="fbe_no_valid_goal_initial")
                 self.using_random_goal = True
             else:
                 self.fronter_this_ex += 1
@@ -1105,7 +1309,8 @@ class SG_Nav_Agent():
             self.goal_map = np.zeros(self.full_map.shape[-2:])
             if self.goal_loc is None:
                 self.random_this_ex += 1
-                self.goal_map = self.set_random_goal()
+                self.record_random_goal("fbe_no_valid_goal_replan")
+                self.goal_map = self.set_random_goal(reason="fbe_no_valid_goal_replan")
                 self.using_random_goal = True
             else:
                 self.fronter_this_ex += 1
@@ -1121,19 +1326,32 @@ class SG_Nav_Agent():
                 self.reset_stop_verification_state(clear_history=False)
             self.loop_time += 1
             self.random_this_ex += 1
+            random_reason = (
+                "agent_stuck_not_move_steps"
+                if self.not_move_steps >= 7
+                else "planner_stop_without_goal"
+            )
+            self.record_random_goal(random_reason)
             if self.loop_time > 20:
                 self.stop_reason = 'no_valid_plan_after_random_retries'
                 return {"action": 0}
             self.not_move_steps = 0
-            self.goal_map = self.set_random_goal()
+            self.goal_map = self.set_random_goal(reason=random_reason)
             self.using_random_goal = True
             stg_y, stg_x, replan, number_action = self._plan(traversible, self.goal_map, self.full_pose, cur_start, cur_start_o, self.found_goal)
         
-        verification_should_run = (
-            (self.stop_verification_active and self.stop_verification_target_gps is not None)
-            or (number_action == 0 and self.found_goal)
-        )
         verification_ran = False
+        liveness_stop = self.apply_stop_liveness_guard()
+        if liveness_stop:
+            number_action = 0
+
+        verification_should_run = (
+            not liveness_stop
+            and (
+                (self.stop_verification_active and self.stop_verification_target_gps is not None)
+                or (number_action == 0 and self.found_goal)
+            )
+        )
         if verification_should_run:
             verification_ran = True
             verified_stop, verification_action = self.handle_stop_verification(observations)
@@ -1153,7 +1371,9 @@ class SG_Nav_Agent():
                     ).copy()
 
         if number_action == 0:
-            if self.found_goal:
+            if self.stop_reason == "near_credible_goal_candidate":
+                pass
+            elif self.found_goal:
                 if not self.stop_reason.startswith("stop_verification_confirmed"):
                     self.stop_reason = 'planner_stop_after_found_goal'
             else:
@@ -1177,6 +1397,20 @@ class SG_Nav_Agent():
     def not_use_random_goal(self):
         self.move_since_random = 0
         self.using_random_goal = False
+
+    def record_random_goal(self, reason):
+        item = {
+            "step": int(self.total_steps),
+            "navigate_step": int(self.navigate_steps),
+            "reason": str(reason),
+            "using_random_goal": bool(self.using_random_goal),
+        }
+        self.random_goal_reasons.append(item)
+        counter_key = "random_goal_" + "".join(
+            ch if ch.isalnum() else "_" for ch in str(reason).lower()
+        )
+        self.scenegraph.debug_stats.inc(counter_key)
+        self.fbe_trace_logger.log_random_fallback(item)
         
     def get_glip_real_label(self, prediction):
         labels = prediction.get_field("labels").tolist()
@@ -1208,6 +1442,23 @@ class SG_Nav_Agent():
         frontier_locations = torch.stack([torch.where(frontier_map)[0], torch.where(frontier_map)[1]]).T
         num_frontiers = len(torch.where(frontier_map)[0])
         if num_frontiers == 0:
+            self.fbe_frontier_count_valid_history.append(0)
+            self.log_fbe_trace({
+                "step": int(self.total_steps),
+                "navigate_step": int(self.navigate_steps),
+                "frontier_count_all": 0,
+                "frontier_count_valid": 0,
+                "distances_16": [],
+                "distance_inverse": [],
+                "scenegraph_scores": [],
+                "total_scores": [],
+                "selected_valid_idx": None,
+                "selected_goal_rc": None,
+                "goal_map_rc": None,
+                "fmm_dist_selected": None,
+                "used_random_goal": True,
+                "reason": "no_frontiers",
+            }, traversible=traversible, start=start)
             return None
         
         # for each frontier, calculate the inverse of distance
@@ -1227,16 +1478,83 @@ class SG_Nav_Agent():
         self.frontier_locations = frontier_locations
         self.frontier_locations_16 = frontier_locations_16
         if len(distances_16) == 0:
+            self.fbe_frontier_count_valid_history.append(0)
+            self.log_fbe_trace({
+                "step": int(self.total_steps),
+                "navigate_step": int(self.navigate_steps),
+                "frontier_count_all": int(num_frontiers),
+                "frontier_count_valid": 0,
+                "distances_16": [],
+                "distance_inverse": [],
+                "scenegraph_scores": [],
+                "total_scores": [],
+                "selected_valid_idx": None,
+                "selected_goal_rc": None,
+                "goal_map_rc": None,
+                "fmm_dist_selected": None,
+                "used_random_goal": True,
+                "reason": "no_frontiers_after_distance_filter",
+            }, traversible=traversible, start=start, frontier_locations_all_rc=frontier_locations - 1)
             return None
         num_16_frontiers = len(idx_16[0])  # 175
 
-        scores = self.scenegraph.score(frontier_locations_16, num_16_frontiers)
-                
-        scores += 2 * distances_16_inverse
-        idx_16_max = idx_16[0][np.argmax(scores)]
+        scenegraph_scores = self.scenegraph.score(frontier_locations_16, num_16_frontiers)
+        scores = scenegraph_scores + 2 * distances_16_inverse
+        selected_valid_idx = int(np.argmax(scores))
+        idx_16_max = idx_16[0][selected_valid_idx]
         goal = frontier_locations[idx_16_max] - 1
         self.scores = scores
+        self.fbe_frontier_count_valid_history.append(int(num_16_frontiers))
+        self.log_fbe_trace({
+            "step": int(self.total_steps),
+            "navigate_step": int(self.navigate_steps),
+            "frontier_count_all": int(num_frontiers),
+            "frontier_count_valid": int(num_16_frontiers),
+            "distances_16": distances_16,
+            "distance_inverse": distances_16_inverse,
+            "scenegraph_scores": scenegraph_scores,
+            "total_scores": scores,
+            "selected_valid_idx": selected_valid_idx,
+            "selected_goal_rc": goal,
+            "goal_map_rc": goal,
+            "fmm_dist_selected": float(fmm_dist[frontier_locations[idx_16_max][0], frontier_locations[idx_16_max][1]]),
+            "used_random_goal": False,
+            "reason": "selected_frontier",
+            "score_mode": getattr(self.args, "sgnav_score_mode", "group"),
+        }, traversible=traversible, start=start,
+            selected_frontier_rc=goal,
+            frontier_locations_valid_rc=frontier_locations_16 - 1,
+            frontier_locations_all_rc=frontier_locations - 1)
         return goal
+
+    def log_fbe_trace(
+        self,
+        sample,
+        *,
+        traversible=None,
+        start=None,
+        selected_frontier_rc=None,
+        frontier_locations_valid_rc=None,
+        frontier_locations_all_rc=None,
+    ):
+        if not self.debug_fbe_trace:
+            return
+        occupancy_map = self.full_map.detach().cpu().numpy()[0, 0, ::-1]
+        free_map = self.fbe_free_map.detach().cpu().numpy()[0, 0, ::-1]
+        candidate_goal_rc = None
+        candidate_gps, _ = self.get_stop_liveness_candidate_gps()
+        if candidate_gps is not None:
+            candidate_goal_rc = self.goal_gps_to_map_rc(candidate_gps)
+        self.fbe_trace_logger.log_decision(
+            sample,
+            occupancy_map=occupancy_map,
+            free_map=free_map,
+            agent_rc=start,
+            selected_frontier_rc=selected_frontier_rc,
+            candidate_goal_rc=candidate_goal_rc,
+            frontier_locations_valid_rc=frontier_locations_valid_rc,
+            frontier_locations_all_rc=frontier_locations_all_rc,
+        )
         
     def get_goal_gps(self, observations, angle, distance):
         if type(angle) is torch.Tensor:
@@ -1435,7 +1753,9 @@ class SG_Nav_Agent():
             try:
                 goal = CH._block_goal(centers, goal, original_goal, goal_found)
             except:
-                goal = self.set_random_goal(goal)
+                self.random_this_ex += 1
+                self.record_random_goal("block_goal_exception")
+                goal = self.set_random_goal(goal, reason="block_goal_exception")
 
         self.planner.set_multi_goal(goal, state) # time cosuming 
 
@@ -1452,7 +1772,7 @@ class SG_Nav_Agent():
         
         return (stg_y, stg_x), replan, stop
     
-    def set_random_goal(self):
+    def set_random_goal(self, base_goal=None, reason="unspecified"):
         obstacle_map = self.full_map.cpu().numpy()[0,0,::-1]
         goal = np.zeros_like(obstacle_map)
         goal_index = np.where((obstacle_map<1))
@@ -1475,7 +1795,7 @@ class SG_Nav_Agent():
         if self.args.visualize:
             if self.simulator._env.episode_over or self.total_steps == 500:
                 self.save_video()
-        if self.simulator._env.episode_over or self.total_steps == 500:
+        if self.simulator._env.episode_over or self.total_steps == self.max_episode_steps:
             self.log_episode_result(metrics)
 
     def log_episode_result(self, metrics):
@@ -1499,6 +1819,13 @@ class SG_Nav_Agent():
             "stop_reason": self.stop_reason,
             "frontier_calls": int(self.fronter_this_ex),
             "random_goal_count": int(self.random_this_ex),
+            "random_goal_reasons": self.random_goal_reasons[-50:],
+            "fbe_frontier_count_valid_history": self.fbe_frontier_count_valid_history,
+            "fbe_frontier_count_valid_summary": self.summarize_fbe_valid_counts(),
+            "sgnav_score_mode": getattr(self.args, "sgnav_score_mode", "group"),
+            "paper_reperception_mode": bool(self.paper_reperception_mode),
+            "disable_extra_stop_verification": bool(self.disable_extra_stop_verification),
+            "reperception_score_norm": self.reperception_score_norm,
             "nodes_final": len(self.scenegraph.get_nodes()),
             "edges_final": len(edges),
             "room_nodes_with_groups": sum(
@@ -1535,11 +1862,25 @@ class SG_Nav_Agent():
                 self.stop_verification_consecutive_failures
             ),
             "stop_verification_history": self.stop_verification_history[-10:],
+            "stop_liveness_decision": self.last_stop_liveness_decision,
             "reperception_rejected_count": len(self.rejected_goal_candidates),
             "reperception_history": self.reperception_history[-10:],
+            "scenegraph_score_debug": getattr(self.scenegraph, "last_score_debug", {}),
             "llm_parse_failures": self.scenegraph.debug_stats.summary(),
         }
         self.episode_logger.log(row)
+
+    def summarize_fbe_valid_counts(self):
+        counts = list(self.fbe_frontier_count_valid_history)
+        if len(counts) == 0:
+            return {"count": 0, "min": None, "max": None, "mean": None}
+        arr = np.asarray(counts, dtype=np.float32)
+        return {
+            "count": int(len(counts)),
+            "min": int(np.min(arr)),
+            "max": int(np.max(arr)),
+            "mean": float(np.mean(arr)),
+        }
 
     def update_visualization_text(self, number_action):
         nodes = self.scenegraph.get_nodes()
@@ -1650,6 +1991,31 @@ def main():
         "--debug_sgnav_dir", default="data/debug_sgnav", type=str
     )
     parser.add_argument(
+        "--debug_fbe_trace", action="store_true"
+    )
+    parser.add_argument(
+        "--fbe_trace_dir", default="data/debug_fbe", type=str
+    )
+    parser.add_argument(
+        "--paper_reperception_mode", action="store_true"
+    )
+    parser.add_argument(
+        "--disable_extra_stop_verification", action="store_true"
+    )
+    parser.add_argument(
+        "--stop_liveness_last_steps", default=5, type=int
+    )
+    parser.add_argument(
+        "--sgnav_score_mode",
+        default="group",
+        choices=["group", "paper_object", "hybrid"],
+    )
+    parser.add_argument(
+        "--reperception_score_norm",
+        default="weighted_mean",
+        choices=["paper_sum", "weighted_mean"],
+    )
+    parser.add_argument(
         "--reperception_min_observations", default=3, type=int
     )
     parser.add_argument(
@@ -1705,6 +2071,21 @@ def main():
     )
     parser.add_argument(
         "--direct_goal_approach_max_steps", default=20, type=int
+    )
+    parser.add_argument(
+        "--edge_update_every_k", default=5, type=int
+    )
+    parser.add_argument(
+        "--score_refresh_every_k", default=5, type=int
+    )
+    parser.add_argument(
+        "--max_edge_proposal_per_step", default=128, type=int
+    )
+    parser.add_argument(
+        "--disable_vlm_short_edge_check", action="store_true"
+    )
+    parser.add_argument(
+        "--disable_llm_edges", action="store_true"
     )
     args = parser.parse_args()
     startup_log(f"args parsed split=[{args.split_l}:{args.split_r}] num_episodes={args.num_episodes}")

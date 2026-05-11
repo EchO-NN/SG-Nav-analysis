@@ -51,7 +51,7 @@ def extract_json(text: str):
         except Exception:
             pass
 
-    for start_char, end_char in [("[", "]"), ("{", "}")]:
+    for start_char, end_char in [("{", "}"), ("[", "]")]:
         start = text.find(start_char)
         end = text.rfind(end_char)
         if start >= 0 and end > start:

@@ -7,6 +7,7 @@ if ROOT_DIR not in sys.path:
 
 from utils.llm_parsing import (
     canonicalize_relation,
+    extract_json,
     parse_probability_01,
     parse_relation_lines,
     parse_room_name,
@@ -27,6 +28,9 @@ def assert_close(actual, expected, eps=1e-6):
 
 def main():
     assert_equal(strip_thinking("<think>hidden</think>\n0.72"), "0.72")
+    assert_equal(extract_json('<think>hidden</think>\n{"probability": 0.72}'), {"probability": 0.72})
+    assert_equal(extract_json('answer:\n```json\n{"room": "bedroom"}\n```'), {"room": "bedroom"})
+    assert_equal(extract_json('extra text {"relationships": ["near"]} trailing'), {"relationships": ["near"]})
     assert_close(parse_probability_01("The probability is 0.72."), 0.72)
     assert_close(parse_probability_01('{"probability": 0.31}'), 0.31)
     assert_close(parse_probability_01("final answer: 64%"), 0.64)

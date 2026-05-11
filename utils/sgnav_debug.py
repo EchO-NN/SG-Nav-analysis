@@ -26,6 +26,7 @@ class SGNavDebugStats:
 
         if not self.enabled:
             return
+        os.makedirs(self.log_dir, exist_ok=True)
 
         item = {
             "request_type": request_type,

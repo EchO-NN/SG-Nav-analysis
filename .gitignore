@@ -5,6 +5,7 @@ glip_large_model.pth
 /.cache
 /.mamba
 /.docker-build
+/.deploy
 /dist
 /GLIP/build
 /GLIP/maskrcnn_benchmark.egg-info

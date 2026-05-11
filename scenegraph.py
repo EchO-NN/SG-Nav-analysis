@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import math
 import os
@@ -6,6 +7,7 @@ import re
 from collections import Counter
 from io import BytesIO
 from pathlib import Path, PosixPath
+from types import SimpleNamespace
 import cv2
 import numpy as np
 import omegaconf
@@ -87,16 +89,29 @@ class VLLMChatClient:
         if extra_body:
             payload.update(extra_body)
 
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
         response = requests.post(
             f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json=payload,
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            if response_format is None:
+                raise
+            payload.pop("response_format", None)
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
         payload_out = response.json()
         return payload_out["choices"][0]["message"].get("content", "")
 
@@ -242,7 +257,11 @@ class SceneGraph():
         self.seg_caption = None
         self._subgraph_score_cache_key = None
         self._subgraph_score_cache = []
+        self._subgraph_score_cache_by_key = {}
         self._wall_orientation_cache = {}
+        self._llm_cache = {}
+        self._vlm_cache = {}
+        self.last_score_debug = {}
         
         self.groundingdino_config_file = 'GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'
         self.groundingdino_checkpoint = 'data/models/groundingdino_swint_ogc.pth'
@@ -258,7 +277,7 @@ class SceneGraph():
         self.node_space = 'bathtub. bed. cabinet. chair. drawers. clothes. counter. cushion. fireplace. gym. picture. plant. seating. shower. sink. sofa. stool. table. toilet. towel. tv. treadmill. fitness equipment.'
         self.prompt_edge_proposal = '''You are an indoor spatial relationship classifier.
 For each object pair, output one short spatial relation.
-Return a JSON array of strings with exactly one string per input pair.
+Return a JSON object with a "relationships" array containing exactly one string per input pair.
 Do not output markdown or explanation.
 Allowed examples: next to, near, above, on top of, opposite to, below, inside, behind, in front of.
 
@@ -268,17 +287,15 @@ Input pairs:
         self.prompt_discriminate_relation = '''Look at the image.
 Question: Do the {} and {} satisfy the relationship "{}"?
 Return exactly one word: yes or no.'''
-        self.prompt_room_predict = 'Which room is the most likely to have the [{}] in: [{}]. Return exactly one room name and no explanation.'
-        self.prompt_graph_corr_0 = '''Return exactly one decimal number from 0 to 1.
-Do not output words, JSON, markdown, units, or explanation.
+        self.prompt_room_predict = 'Which room is the most likely to have the [{}] in: [{}]. Return a JSON object like {{"room": "bedroom"}} and no explanation.'
+        self.prompt_graph_corr_0 = '''Return a JSON object like {{"probability": 0.5}}.
 Question: What is the probability of A and B appearing together?
 A: [{}]
 B: [{}]
 Answer:'''
         self.prompt_graph_corr_1 = 'What else do you need to know to determine the probability of A and B appearing together? [A:{}], [B:{}]. Please output a short question (output only one sentence with no additional text).'
         self.prompt_graph_corr_2 = 'Here is the objects and relationships near A: [{}] You answer the following question with a short sentence based on this information. Question: {}'
-        self.prompt_graph_corr_3 = '''Return exactly one decimal number from 0 to 1.
-Do not output words, JSON, markdown, units, or explanation.
+        self.prompt_graph_corr_3 = '''Return a JSON object like {{"probability": 0.5}}.
 Initial probability: {}
 Dialog: [{}]
 A: [{}]
@@ -307,7 +324,9 @@ Final probability:'''
         self.last_debug_print_step = None
         self._subgraph_score_cache_key = None
         self._subgraph_score_cache = []
+        self._subgraph_score_cache_by_key = {}
         self._wall_orientation_cache = {}
+        self.last_score_debug = {}
 
     def set_cfg(self):
         cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': self.device, 'use_iou': True, 'spatial_sim_type': 'overlap', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.025, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 10, 'obj_min_points': 0, 'obj_min_detections': 3, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
@@ -319,6 +338,29 @@ Final probability:'''
 
     def set_agent(self, agent):
         self.agent = agent
+
+    def get_arg(self, name, default=None):
+        args = getattr(getattr(self, "agent", None), "args", None)
+        return getattr(args, name, default)
+
+    def score_mode(self):
+        return self.get_arg("sgnav_score_mode", "group")
+
+    def score_refresh_bucket(self):
+        every_k = max(1, int(self.get_arg("score_refresh_every_k", 5)))
+        return int(getattr(self, "navigate_steps", -1)) // every_k
+
+    def edge_update_every_k(self):
+        return max(1, int(self.get_arg("edge_update_every_k", 5)))
+
+    def max_edge_proposal_per_step(self):
+        return int(self.get_arg("max_edge_proposal_per_step", 128))
+
+    def disable_vlm_short_edge_check(self):
+        return bool(self.get_arg("disable_vlm_short_edge_check", False))
+
+    def disable_llm_edges(self):
+        return bool(self.get_arg("disable_llm_edges", False))
 
     def set_debug(self, enabled=False, log_dir="data/debug_sgnav"):
         self.debug_enabled = enabled
@@ -715,15 +757,15 @@ Final probability:'''
         for node in self.nodes:
             points = np.asarray(node.object['pcd'].points)
             center = points.mean(axis=0)
-            x = int(center[0] * 100 / self.map_resolution)
-            y = int(center[1] * 100 / self.map_resolution)
-            y = self.map_size - 1 - y
-            node.set_center([x, y])
-            if 0 <= x < self.map_size and 0 <= y < self.map_size and hasattr(self, 'room_map'):
-                if sum(self.room_map[0, :, y, x]!=0).item() == 0:
+            map_x = int(center[0] * 100 / self.map_resolution)
+            map_y = int(center[1] * 100 / self.map_resolution)
+            map_y = self.map_size - 1 - map_y
+            node.set_center([map_x, map_y])
+            if 0 <= map_x < self.map_size and 0 <= map_y < self.map_size and hasattr(self, 'room_map'):
+                if sum(self.room_map[0, :, map_y, map_x]!=0).item() == 0:
                     room_label = 0
                 else:
-                    room_label = torch.where(self.room_map[0, :, y, x]!=0)[0][0].item()
+                    room_label = torch.where(self.room_map[0, :, map_y, map_x]!=0)[0][0].item()
             else:
                 room_label = 0
             if node.room_node is not self.room_nodes[room_label]:
@@ -759,6 +801,12 @@ Final probability:'''
                 new_edge = Edge(new_node1, new_node2)
                 new_edges.append(new_edge)
                 created_count += 1
+        max_edges = self.max_edge_proposal_per_step()
+        if max_edges > 0 and len(new_edges) > max_edges:
+            for edge in new_edges[max_edges:]:
+                edge.delete()
+            self.debug_stats.inc("edge_proposal_throttled", len(new_edges) - max_edges)
+            new_edges = new_edges[:max_edges]
         self.debug_stats.inc("edges_created", created_count)
         # get all new_edges
         new_edges = set()
@@ -769,7 +817,7 @@ Final probability:'''
         all_new_edges = list(new_edges)
         for new_edge in new_edges:
             image = self.get_joint_image(new_edge.node1, new_edge.node2)
-            if image is not None:
+            if image is not None and not self.disable_vlm_short_edge_check():
                 prompt = self.prompt_relation.format(new_edge.node1.caption, new_edge.node2.caption)
                 response = self.get_vlm_response(
                     prompt=prompt,
@@ -778,6 +826,8 @@ Final probability:'''
                     max_tokens=16,
                 )
                 new_edge.set_relation(canonicalize_relation(response))
+            elif image is not None:
+                self.debug_stats.inc("relation_from_image_skipped")
         new_edges = set()
         for i, node in enumerate(self.nodes):
             node_new_edges = set(filter(lambda edge: edge.relation is None, node.edges))
@@ -820,6 +870,7 @@ Final probability:'''
                 prompt=prompt,
                 request_type="edge_proposal",
                 max_tokens=max(96, 24 * len(batch)),
+                response_format={"type": "json_object"},
             )
             batch_relations = parse_relation_lines(raw, expected_n=len(batch))
             if batch_relations is None:
@@ -875,6 +926,7 @@ Final probability:'''
             prompt=prompt,
             request_type="room_predict",
             max_tokens=16,
+            response_format={"type": "json_object"},
         )
         room_name = parse_room_name(response, [room_node.caption for room_node in self.room_nodes])
         predict_room_node = None
@@ -904,19 +956,27 @@ Final probability:'''
         return self.mid_term_goal
 
     def get_scored_subgraphs_for_goal(self, goal, force_refresh=False):
-        """Return group-based subgraph scores for frontier scoring and re-perception.
+        mode = self.score_mode()
+        if mode == "paper_object":
+            return self.get_object_centered_subgraphs_for_goal(goal, force_refresh=force_refresh)
+        if mode == "hybrid":
+            return (
+                self._get_group_scored_subgraphs_for_goal(goal, force_refresh=force_refresh)
+                + self.get_object_centered_subgraphs_for_goal(goal, force_refresh=force_refresh)
+            )
+        return self._get_group_scored_subgraphs_for_goal(goal, force_refresh=force_refresh)
 
-        The paper defines one subgraph around each object node. This implementation
-        reuses the existing GroupNode abstraction because SG-Nav already scores
-        those groups with graph_corr during frontier selection.
-        """
-        cache_key = (goal, getattr(self, "navigate_steps", -1), len(self.nodes), len(self.get_edges()))
-        if (
-            not force_refresh
-            and self._subgraph_score_cache_key == cache_key
-            and self._subgraph_score_cache is not None
-        ):
-            return self._subgraph_score_cache
+    def _get_group_scored_subgraphs_for_goal(self, goal, force_refresh=False):
+        """Return the legacy GroupNode-based subgraph scores."""
+        cache_key = (
+            "group",
+            goal,
+            self.score_refresh_bucket(),
+            len(self.nodes),
+            len(self.get_edges()),
+        )
+        if not force_refresh and cache_key in self._subgraph_score_cache_by_key:
+            return self._subgraph_score_cache_by_key[cache_key]
 
         self.update_group()
         items = []
@@ -940,8 +1000,148 @@ Final probability:'''
 
         self._subgraph_score_cache_key = cache_key
         self._subgraph_score_cache = items
+        self._subgraph_score_cache_by_key[cache_key] = items
         self.debug_stats.inc("subgraph_score_refresh")
         return items
+
+    def get_object_centered_subgraphs_for_goal(self, goal, force_refresh=False):
+        """Return paper-aligned object-centered subgraphs.
+
+        Each subgraph is centered on one object node and includes its parent room,
+        containing group if available, directly connected object nodes, directly
+        connected edges, and lightweight observation metadata.
+        """
+        cache_key = (
+            "paper_object",
+            goal,
+            self.score_refresh_bucket(),
+            len(self.nodes),
+            len(self.get_edges()),
+        )
+        if not force_refresh and cache_key in self._subgraph_score_cache_by_key:
+            return self._subgraph_score_cache_by_key[cache_key]
+
+        self.update_group()
+        group_by_node = {}
+        for room_node in self.room_nodes:
+            for group_node in room_node.group_nodes:
+                for node in group_node.nodes:
+                    group_by_node[node] = group_node
+
+        items = []
+        for node in self.nodes:
+            if getattr(node, "center", None) is None or getattr(node, "caption", None) is None:
+                continue
+            group_node = group_by_node.get(node)
+            edges = [edge for edge in node.edges if edge.relation]
+            neighbor_nodes = []
+            for edge in edges:
+                neighbor = edge.node2 if edge.node1 is node else edge.node1
+                if getattr(neighbor, "caption", None):
+                    neighbor_nodes.append(neighbor)
+            caption = self.object_subgraph_to_text(node, group_node, neighbor_nodes, edges)
+            graph = SimpleNamespace(center_node=node, caption=caption)
+            p_sub = float(self.graph_corr(goal, graph))
+            p_sub = float(np.clip(p_sub, 0.0, 1.0))
+            room_node = getattr(node, "room_node", None)
+            items.append({
+                "score": p_sub,
+                "center_xy": np.array(node.center, dtype=np.float32),
+                "center_node": node,
+                "group_node": group_node,
+                "room": getattr(room_node, "caption", ""),
+                "nodes_text": ", ".join([node.caption] + [n.caption for n in neighbor_nodes]),
+                "edges_text": ", ".join(edge.text() for edge in edges),
+                "caption": caption,
+                "object_confidence": self.node_confidence(node),
+                "observation_count": self.node_observation_count(node),
+            })
+
+        self._subgraph_score_cache_key = cache_key
+        self._subgraph_score_cache = items
+        self._subgraph_score_cache_by_key[cache_key] = items
+        self.debug_stats.inc("paper_subgraph_score_refresh")
+        self.debug_stats.inc("paper_subgraph_count", len(items))
+        return items
+
+    def object_subgraph_to_text(self, node, group_node, neighbor_nodes, edges):
+        room_name = getattr(getattr(node, "room_node", None), "caption", "unknown room")
+        group_text = getattr(group_node, "caption", "") if group_node is not None else ""
+        neighbors_text = ", ".join(n.caption for n in neighbor_nodes) or "none"
+        edges_text = ", ".join(edge.text() for edge in edges) or "none"
+        confidence = self.node_confidence(node)
+        observation_count = self.node_observation_count(node)
+        return (
+            f"Center object: {node.caption}. "
+            f"Room: {room_name}. "
+            f"Group context: {group_text or 'none'}. "
+            f"Connected objects: {neighbors_text}. "
+            f"Edges: {edges_text}. "
+            f"Object confidence: {confidence:.3f}. "
+            f"Observation count: {observation_count}."
+        )
+
+    def node_confidence(self, node):
+        obj = getattr(node, "object", None) or {}
+        conf = obj.get("conf", obj.get("confidence", []))
+        try:
+            if torch.is_tensor(conf):
+                conf = conf.detach().cpu().numpy()
+            arr = np.asarray(conf, dtype=np.float32).reshape(-1)
+            if arr.size == 0:
+                return 0.0
+            return float(np.nanmax(arr))
+        except Exception:
+            return 0.0
+
+    def node_observation_count(self, node):
+        obj = getattr(node, "object", None) or {}
+        image_idx = obj.get("image_idx", [])
+        try:
+            return int(len(image_idx))
+        except Exception:
+            return 0
+
+    def score_frontiers_by_subgraphs(self, frontier_locations, goal):
+        subgraphs = self.get_object_centered_subgraphs_for_goal(goal)
+        if len(subgraphs) == 0:
+            self.last_score_debug = {
+                "mode": self.score_mode(),
+                "num_subgraphs": 0,
+                "frontier_score_min": 0.0,
+                "frontier_score_max": 0.0,
+                "frontier_score_mean": 0.0,
+            }
+            return np.zeros(len(frontier_locations), dtype=np.float32)
+
+        scores = []
+        for frontier in frontier_locations:
+            score_sum = 0.0
+            weight_sum = 0.0
+            for subgraph in subgraphs:
+                d_pix = np.linalg.norm(
+                    np.asarray(frontier, dtype=np.float32)
+                    - np.asarray(subgraph["center_xy"], dtype=np.float32)
+                )
+                d_m = max(float(d_pix) * self.map_resolution / 100.0, 0.25)
+                weight = 1.0 / d_m
+                score_sum += float(subgraph["score"]) * weight
+                weight_sum += weight
+            scores.append(score_sum / max(weight_sum, 1e-6))
+        scores = np.asarray(scores, dtype=np.float32)
+        self.last_score_debug = {
+            "mode": self.score_mode(),
+            "num_subgraphs": int(len(subgraphs)),
+            "frontier_score_min": float(np.min(scores)) if len(scores) else 0.0,
+            "frontier_score_max": float(np.max(scores)) if len(scores) else 0.0,
+            "frontier_score_mean": float(np.mean(scores)) if len(scores) else 0.0,
+        }
+        self.debug_stats.log_response(
+            "subgraph_score_distribution",
+            prompt=f"goal={goal}",
+            response=json.dumps(self.last_score_debug),
+        )
+        return scores
 
     def fallback_room_by_cooccurrence(self):
         if not hasattr(self.agent, "prob_array_room"):
@@ -966,7 +1166,14 @@ Final probability:'''
             self.mapping3d()
             self.get_caption()
             self.update_node()
-            self.update_edge()
+            if self.disable_llm_edges():
+                for node in self.nodes:
+                    node.is_new_node = False
+                self.debug_stats.inc("edge_update_disabled")
+            elif self.navigate_steps % self.edge_update_every_k() == 0:
+                self.update_edge()
+            else:
+                self.debug_stats.inc("edge_update_skipped")
         if (
             self.debug_enabled
             and self.navigate_steps % 20 == 0
@@ -983,7 +1190,23 @@ Final probability:'''
         response_format=None,
         extra_body=None,
     ):
-        self.debug_stats.inc("llm_calls_total")
+        cache_payload = json.dumps(
+            {
+                "request_type": request_type,
+                "model": self.llm_name,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "response_format": response_format,
+                "extra_body": extra_body,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        cache_key = hashlib.sha1(cache_payload.encode("utf-8")).hexdigest()
+        if cache_key in self._llm_cache:
+            self.debug_stats.inc("llm_cache_hit")
+            return self._llm_cache[cache_key]
+
         system = {
             "role": "system",
             "content": (
@@ -1008,15 +1231,34 @@ Final probability:'''
             response_format=response_format,
             extra_body=extra_body,
         )
+        self.debug_stats.inc("llm_calls_total")
+        self._llm_cache[cache_key] = response
         self.debug_stats.log_response(request_type, prompt, response)
         return response
     
     def get_vlm_response(self, prompt, image, request_type="vlm", max_tokens=None):
         buffered = BytesIO()
         image.save(buffered, format='PNG')
-        image_bytes = base64.b64encode(buffered.getvalue())
+        raw_image_bytes = buffered.getvalue()
+        image_hash = hashlib.sha1(raw_image_bytes).hexdigest()
+        cache_payload = json.dumps(
+            {
+                "request_type": request_type,
+                "model": self.vlm_name,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "image_hash": image_hash,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        cache_key = hashlib.sha1(cache_payload.encode("utf-8")).hexdigest()
+        if cache_key in self._vlm_cache:
+            self.debug_stats.inc("vlm_cache_hit")
+            return self._vlm_cache[cache_key]
+
+        image_bytes = base64.b64encode(raw_image_bytes)
         image_str = str(image_bytes, 'utf-8')
-        self.debug_stats.inc("vlm_calls_total")
         system = {
             "role": "system",
             "content": "You are a strict visual classifier. Return only the requested short answer.",
@@ -1043,6 +1285,8 @@ Final probability:'''
             temperature=0.0,
             top_p=1.0,
         )
+        self.debug_stats.inc("vlm_calls_total")
+        self._vlm_cache[cache_key] = response
         self.debug_stats.log_response(
             request_type,
             prompt,
@@ -1080,6 +1324,15 @@ Final probability:'''
         return image
 
     def score(self, frontier_locations_16, num_16_frontiers):
+        mode = self.score_mode()
+        if mode == "paper_object":
+            return np.nan_to_num(
+                self.score_frontiers_by_subgraphs(frontier_locations_16, self.obj_goal_sg),
+                nan=0.0,
+                posinf=1e6,
+                neginf=-1e6,
+            )
+
         scores = np.zeros((num_16_frontiers))
         for i, loc in enumerate(frontier_locations_16):
             sub_room_map = self.agent.room_map[0,:,max(0,loc[0]-12):min(self.agent.map_size-1,loc[0]+13), max(0,loc[1]-12):min(self.agent.map_size-1,loc[1]+13)].cpu().numpy() # sub_room_map.shape = [9, 25, 25], select the room map around the frontier
@@ -1112,12 +1365,26 @@ Final probability:'''
             score[distance > 32] = 0
             score = score / np.maximum(distance, 1.0)
             scores += score
+        if mode == "hybrid":
+            scores += self.score_frontiers_by_subgraphs(frontier_locations_16, self.obj_goal_sg)
+        else:
+            self.last_score_debug = {
+                "mode": mode,
+                "num_subgraphs": None,
+                "frontier_score_min": float(np.min(scores)) if len(scores) else 0.0,
+                "frontier_score_max": float(np.max(scores)) if len(scores) else 0.0,
+                "frontier_score_mean": float(np.mean(scores)) if len(scores) else 0.0,
+            }
         return np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=-1e6)
 
     def discriminate_relation(self, edge):
         self.debug_stats.inc("discriminate_total")
         image = self.get_joint_image(edge.node1, edge.node2)
         if image is not None:
+            if self.disable_vlm_short_edge_check():
+                self.debug_stats.inc("edge_short_vlm_check_skipped")
+                self.debug_stats.inc("discriminate_yes")
+                return True
             return self.validate_short_edge(edge, image)
         return self.validate_long_edge(edge)
 
@@ -1305,6 +1572,7 @@ Final probability:'''
             prompt=prompt,
             request_type="graph_corr_probability",
             max_tokens=16,
+            response_format={"type": "json_object"},
         )
         initial_probability = self.parse_probability_response(
             response_0,
@@ -1333,6 +1601,7 @@ Final probability:'''
             prompt=prompt,
             request_type="graph_corr_final",
             max_tokens=16,
+            response_format={"type": "json_object"},
         )
         corr_score = self.parse_probability_response(
             response_3,
