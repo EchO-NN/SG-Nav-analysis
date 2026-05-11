@@ -84,6 +84,28 @@ def parse_probability_01(text: str, default: float = 0.0) -> float:
     return float(max(0.0, min(1.0, value)))
 
 
+def parse_distance_m(text: str, default: float = 10.0) -> float:
+    text = strip_thinking(text)
+    data = extract_json(text)
+
+    if isinstance(data, dict):
+        for key in ["distance", "distance_m", "meters", "metres", "value", "answer"]:
+            if key in data:
+                return parse_distance_m(str(data[key]), default=default)
+    elif isinstance(data, (int, float)):
+        return float(max(0.05, data))
+
+    nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text)
+    if not nums:
+        return float(default)
+
+    value = float(nums[-1])
+    lowered = text.lower()
+    if "cm" in lowered and "m" not in lowered.replace("cm", ""):
+        value = value / 100.0
+    return float(max(0.05, value))
+
+
 def parse_yes_no(text: str, default: bool = False) -> bool:
     text = strip_thinking(text).strip().lower()
     data = extract_json(text)

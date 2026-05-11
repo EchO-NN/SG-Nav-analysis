@@ -23,11 +23,16 @@ from GroundingDINO.groundingdino.datasets import transforms as T
 
 from utils.utils_scenegraph.mapping import compute_spatial_similarities, merge_detections_to_objects
 from utils.utils_scenegraph.slam_classes import MapObjectList
-from utils.utils_scenegraph.utils import filter_objects, gobs_to_detection_list
+from utils.utils_scenegraph.utils import (
+    filter_objects,
+    gobs_to_detection_list,
+    merge_obj2_into_obj1,
+)
 from utils.utils_scenegraph.grounded_sam_demo import get_grounding_output, load_image, load_model
 from utils.llm_parsing import (
     canonicalize_relation,
     extract_json,
+    parse_distance_m,
     parse_probability_01,
     parse_relation_lines,
     parse_room_name,
@@ -122,6 +127,10 @@ class RoomNode():
         self.exploration_level = 0
         self.nodes = set()
         self.group_nodes = []
+        self.center = None
+        self.map_mask = None
+        self.map_score = 0.0
+        self.active = False
 
 
 class GroupNode():
@@ -131,6 +140,7 @@ class GroupNode():
         self.corr_score = 0
         self.center = None
         self.center_node = None
+        self.room_node = None
         self.nodes = []
         self.edges = set()
     
@@ -147,6 +157,12 @@ class GroupNode():
                 self.center_node = node
             self.edges.update(node.edges)
         self.caption = self.graph_to_text(self.nodes, self.edges)
+        if self.room_node is not None:
+            group_text = " and ".join(node.caption for node in self.nodes)
+            self.caption += (
+                f" Parent room node: {self.room_node.caption}. "
+                f"Affiliation edge: ({group_text}, belongs to, {self.room_node.caption})."
+            )
 
     def graph_to_text(self, nodes, edges):
         nodes_text = ', '.join([node.caption for node in nodes])
@@ -163,6 +179,8 @@ class ObjectNode():
         self.reason = None
         self.center = None
         self.room_node = None
+        self.room_membership_score = 0.0
+        self.room_containment_ratio = 0.0
         self.exploration_level = 0
         self.distance = 2
         self.score = 0.5
@@ -262,6 +280,7 @@ class SceneGraph():
         self._llm_cache = {}
         self._vlm_cache = {}
         self.last_score_debug = {}
+        self._room_graph_version = 0
         
         self.groundingdino_config_file = 'GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'
         self.groundingdino_checkpoint = 'data/models/groundingdino_swint_ogc.pth'
@@ -275,6 +294,7 @@ class SceneGraph():
         self.N_max = 10
         self.edge_proposal_batch_size = int(os.environ.get("SGNAV_EDGE_PROPOSAL_BATCH_SIZE", "12"))
         self.node_space = 'bathtub. bed. cabinet. chair. drawers. clothes. counter. cushion. fireplace. gym. picture. plant. seating. shower. sink. sofa. stool. table. toilet. towel. tv. treadmill. fitness equipment.'
+        self.related_category_pairs = self.build_related_category_pairs()
         self.prompt_edge_proposal = '''You are an indoor spatial relationship classifier.
 For each object pair, output one short spatial relation.
 Return a JSON object with a "relationships" array containing exactly one string per input pair.
@@ -288,19 +308,24 @@ Input pairs:
 Question: Do the {} and {} satisfy the relationship "{}"?
 Return exactly one word: yes or no.'''
         self.prompt_room_predict = 'Which room is the most likely to have the [{}] in: [{}]. Return a JSON object like {{"room": "bedroom"}} and no explanation.'
-        self.prompt_graph_corr_0 = '''Return a JSON object like {{"probability": 0.5}}.
-Question: What is the probability of A and B appearing together?
+        self.prompt_graph_corr_0 = '''Return a JSON object like {{"distance": 2.0, "reason": "short reason"}}.
+Question: What is the most likely distance in meters between A and B in an indoor scene?
 A: [{}]
 B: [{}]
 Answer:'''
-        self.prompt_graph_corr_1 = 'What else do you need to know to determine the probability of A and B appearing together? [A:{}], [B:{}]. Please output a short question (output only one sentence with no additional text).'
-        self.prompt_graph_corr_2 = 'Here is the objects and relationships near A: [{}] You answer the following question with a short sentence based on this information. Question: {}'
-        self.prompt_graph_corr_3 = '''Return a JSON object like {{"probability": 0.5}}.
-Initial probability: {}
+        self.prompt_graph_corr_1 = 'Ask one short question about the spatial relationship between the object and the goal for predicting their distance. Object: [{}]. Goal: [{}]. Output only the question.'
+        self.prompt_graph_corr_2 = 'Given this subgraph with nodes and edges: [{}] Answer the following question with a short sentence based only on the subgraph. Question: {}'
+        self.prompt_graph_corr_3 = '''Return a JSON object like {{"distance": 2.0, "reason": "short reason"}}.
+Initial object-goal distance estimate in meters: {}
 Dialog: [{}]
 A: [{}]
 B: [{}]
-Final probability:'''
+Final most likely distance in meters between this subgraph and the goal:'''
+        self.prompt_frontier_explanation = '''Return a JSON object like {{"explanation": "short reason"}}.
+Goal: [{}]
+Selected frontier evidence from the nearest 3 subgraphs:
+{}
+Summarize why this frontier is promising or not promising for finding the goal in one concise sentence.'''
         self.mask_generator = self.get_sam_mask_generator(self.sam_variant, self.device)
         self.set_cfg()
         self.set_agent(agent)
@@ -327,6 +352,7 @@ Final probability:'''
         self._subgraph_score_cache_by_key = {}
         self._wall_orientation_cache = {}
         self.last_score_debug = {}
+        self._room_graph_version = 0
 
     def set_cfg(self):
         cfg = {'dataset_config': PosixPath('tools/replica.yaml'), 'scene_id': 'room0', 'start': 0, 'end': -1, 'stride': 5, 'image_height': 680, 'image_width': 1200, 'gsa_variant': 'none', 'detection_folder_name': 'gsa_detections_${gsa_variant}', 'det_vis_folder_name': 'gsa_vis_${gsa_variant}', 'color_file_name': 'gsa_classes_${gsa_variant}', 'device': self.device, 'use_iou': True, 'spatial_sim_type': 'overlap', 'phys_bias': 0.0, 'match_method': 'sim_sum', 'semantic_threshold': 0.5, 'physical_threshold': 0.5, 'sim_threshold': 1.2, 'use_contain_number': False, 'contain_area_thresh': 0.95, 'contain_mismatch_penalty': 0.5, 'mask_area_threshold': 25, 'mask_conf_threshold': 0.95, 'max_bbox_area_ratio': 0.5, 'skip_bg': True, 'min_points_threshold': 16, 'downsample_voxel_size': 0.025, 'dbscan_remove_noise': True, 'dbscan_eps': 0.1, 'dbscan_min_points': 10, 'obj_min_points': 0, 'obj_min_detections': 3, 'merge_overlap_thresh': 0.7, 'merge_visual_sim_thresh': 0.8, 'merge_text_sim_thresh': 0.8, 'denoise_interval': 20, 'filter_interval': -1, 'merge_interval': 20, 'save_pcd': True, 'save_suffix': 'overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub', 'vis_render': False, 'debug_render': False, 'class_agnostic': True, 'save_objects_all_frames': True, 'render_camera_path': 'replica_room0.json', 'max_num_points': 512}
@@ -343,6 +369,82 @@ Final probability:'''
         args = getattr(getattr(self, "agent", None), "args", None)
         return getattr(args, name, default)
 
+    def build_related_category_pairs(self):
+        pairs = [
+            ("bed", "nightstand"),
+            ("wardrobe", "dresser"),
+            ("bookshelf", "chair"),
+            ("counter", "stove"),
+            ("table", "chair"),
+            ("bathroom sink", "mirror"),
+            ("shower", "bathtub"),
+            ("refrigerator", "freezer"),
+            ("oven", "microwave"),
+            ("washing machine", "dryer"),
+            ("sofa", "table"),
+            ("desk", "office chair"),
+            ("computer", "monitor"),
+            ("piano", "bench"),
+            ("fireplace", "mantel"),
+            ("table", "mirror"),
+            ("window", "curtains"),
+            ("closet", "hangers"),
+            ("bathroom cabinet", "toiletries"),
+            ("living room rug", "coffee table"),
+            ("kitchen cabinet", "dishes"),
+            ("dining room chandelier", "dining table"),
+            ("clock", "wall"),
+            ("floor lamp", "reading chair"),
+            ("couch", "throw pillows"),
+            ("bookcase", "books"),
+            ("tv", "tv cabinet"),
+        ]
+        return {tuple(sorted(pair)) for pair in pairs}
+
+    def normalize_category(self, caption):
+        text = str(caption or "").lower().replace("_", " ")
+        text = re.sub(r"[^a-z0-9 ]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        aliases = {
+            "chest of drawers": "dresser",
+            "drawers": "dresser",
+            "bookcase": "bookshelf",
+            "couch": "sofa",
+            "television": "tv",
+            "tv monitor": "tv",
+            "monitor": "tv",
+            "office chair": "chair",
+            "dining table": "table",
+            "coffee table": "table",
+            "reading chair": "chair",
+            "bathroom sink": "sink",
+            "tv cabinet": "cabinet",
+        }
+        return aliases.get(text, text)
+
+    def category_matches_pattern(self, caption, pattern):
+        caption = self.normalize_category(caption)
+        pattern = self.normalize_category(pattern)
+        if caption == pattern:
+            return True
+        if pattern in caption:
+            return True
+        if caption in pattern and len(caption) > 2:
+            return True
+        return False
+
+    def categories_related_for_group(self, caption_a, caption_b):
+        for pattern_a, pattern_b in self.related_category_pairs:
+            if (
+                self.category_matches_pattern(caption_a, pattern_a)
+                and self.category_matches_pattern(caption_b, pattern_b)
+            ) or (
+                self.category_matches_pattern(caption_a, pattern_b)
+                and self.category_matches_pattern(caption_b, pattern_a)
+            ):
+                return True
+        return False
+
     def score_mode(self):
         return self.get_arg("sgnav_score_mode", "group")
 
@@ -355,6 +457,39 @@ Final probability:'''
 
     def max_edge_proposal_per_step(self):
         return int(self.get_arg("max_edge_proposal_per_step", 128))
+
+    def room_map_active_threshold(self):
+        return float(self.get_arg("paper_room_map_active_threshold", 0.05))
+
+    def room_membership_min_score(self):
+        return float(self.get_arg("paper_room_min_membership_score", 0.01))
+
+    def room_point_sample_limit(self):
+        return max(1, int(self.get_arg("paper_room_point_sample_limit", 512)))
+
+    def duplicate_object_merge_enabled(self):
+        return bool(int(self.get_arg("object_duplicate_merge_enabled", 1)))
+
+    def duplicate_merge_center_m(self):
+        return float(self.get_arg("object_duplicate_merge_center_m", 0.80))
+
+    def duplicate_merge_strong_center_m(self):
+        return float(self.get_arg("object_duplicate_merge_strong_center_m", 0.35))
+
+    def duplicate_merge_point_distance_m(self):
+        return float(self.get_arg("object_duplicate_merge_point_distance_m", 0.08))
+
+    def duplicate_merge_point_overlap(self):
+        return float(self.get_arg("object_duplicate_merge_point_overlap", 0.12))
+
+    def duplicate_merge_bbox_iou(self):
+        return float(self.get_arg("object_duplicate_merge_bbox_iou", 0.05))
+
+    def duplicate_merge_bbox_containment(self):
+        return float(self.get_arg("object_duplicate_merge_bbox_containment", 0.55))
+
+    def duplicate_merge_max_passes(self):
+        return max(1, int(self.get_arg("object_duplicate_merge_max_passes", 3)))
 
     def disable_vlm_short_edge_check(self):
         return bool(self.get_arg("disable_vlm_short_edge_check", False))
@@ -421,6 +556,117 @@ Final probability:'''
             room_node = RoomNode(caption)
             room_nodes.append(room_node)
         self.room_nodes = room_nodes
+
+    def room_map_to_numpy(self):
+        if not hasattr(self, "room_map"):
+            return None
+        room_map = self.room_map
+        if torch.is_tensor(room_map):
+            room_map = room_map.detach().cpu().numpy()
+        else:
+            room_map = np.asarray(room_map)
+        if room_map.ndim == 4:
+            room_map = room_map[0]
+        if room_map.ndim != 3 or room_map.shape[0] == 0:
+            return None
+        return room_map
+
+    def refresh_room_nodes_from_room_map(self):
+        self._room_graph_version += 1
+        room_map = self.room_map_to_numpy()
+        active_threshold = self.room_map_active_threshold()
+        for room_node in self.room_nodes:
+            room_node.nodes.clear()
+            room_node.group_nodes = []
+            room_node.center = None
+            room_node.map_mask = None
+            room_node.map_score = 0.0
+            room_node.active = False
+        if room_map is None:
+            self.debug_stats.inc("paper_room_map_missing")
+            return
+
+        for idx, room_node in enumerate(self.room_nodes):
+            if idx >= room_map.shape[0]:
+                continue
+            channel = np.asarray(room_map[idx], dtype=np.float32)
+            mask = channel > active_threshold
+            room_node.map_mask = mask
+            if np.any(mask):
+                ys, xs = np.where(mask)
+                weights = channel[ys, xs]
+                weight_sum = float(np.sum(weights))
+                if weight_sum > 1e-6:
+                    cx = float(np.sum(xs * weights) / weight_sum)
+                    cy = float(np.sum(ys * weights) / weight_sum)
+                else:
+                    cx = float(np.mean(xs))
+                    cy = float(np.mean(ys))
+                room_node.center = [cx, cy]
+                room_node.map_score = float(np.max(channel))
+                room_node.active = True
+        active_rooms = sum(1 for room_node in self.room_nodes if room_node.active)
+        self.debug_stats.inc("paper_room_map_refresh")
+        self.debug_stats.inc("paper_room_active_count", active_rooms)
+
+    def object_points_to_map_xy(self, points):
+        if points is None or len(points) == 0:
+            return None, None
+        points = np.asarray(points)
+        if points.ndim != 2 or points.shape[1] < 2:
+            return None, None
+        limit = self.room_point_sample_limit()
+        if len(points) > limit:
+            stride = max(1, len(points) // limit)
+            points = points[::stride][:limit]
+        xs = np.rint(points[:, 0] * 100.0 / self.map_resolution).astype(np.int32)
+        ys = np.rint(points[:, 1] * 100.0 / self.map_resolution).astype(np.int32)
+        ys = self.map_size - 1 - ys
+        valid = (
+            (xs >= 0)
+            & (xs < self.map_size)
+            & (ys >= 0)
+            & (ys < self.map_size)
+        )
+        if not np.any(valid):
+            return None, None
+        return xs[valid], ys[valid]
+
+    def assign_room_node_by_containment(self, node, points):
+        room_map = self.room_map_to_numpy()
+        xs, ys = self.object_points_to_map_xy(points)
+        if room_map is None or xs is None or ys is None:
+            return None, 0.0, 0.0
+
+        room_samples = room_map[:, ys, xs]
+        if room_samples.size == 0:
+            return None, 0.0, 0.0
+        mean_scores = np.mean(room_samples, axis=1)
+        coverage = np.mean(
+            room_samples > self.room_map_active_threshold(),
+            axis=1,
+        )
+        combined = mean_scores + coverage
+        best_idx = int(np.argmax(combined))
+        best_score = float(mean_scores[best_idx])
+        best_coverage = float(coverage[best_idx])
+        if combined[best_idx] < self.room_membership_min_score():
+            return None, best_score, best_coverage
+        if best_idx >= len(self.room_nodes):
+            return None, best_score, best_coverage
+        return self.room_nodes[best_idx], best_score, best_coverage
+
+    def set_node_room(self, node, room_node, membership_score=0.0, containment_ratio=0.0):
+        if node.room_node is not room_node:
+            if node.room_node is not None:
+                node.room_node.nodes.discard(node)
+            node.room_node = room_node
+            if room_node is not None:
+                room_node.nodes.add(node)
+        elif room_node is not None:
+            room_node.nodes.add(node)
+        node.room_membership_score = float(membership_score)
+        node.room_containment_ratio = float(containment_ratio)
 
     def get_sam_mask_generator(self, variant:str, device) -> SamAutomaticMaskGenerator:
         if variant == "sam":
@@ -739,6 +985,7 @@ Final probability:'''
                 object['captions'] = [caption]
 
     def update_node(self):
+        self.refresh_room_nodes_from_room_map()
         # update nodes
         for i, node in enumerate(self.nodes):
             caption_ori = node.caption
@@ -761,18 +1008,16 @@ Final probability:'''
             map_y = int(center[1] * 100 / self.map_resolution)
             map_y = self.map_size - 1 - map_y
             node.set_center([map_x, map_y])
-            if 0 <= map_x < self.map_size and 0 <= map_y < self.map_size and hasattr(self, 'room_map'):
-                if sum(self.room_map[0, :, map_y, map_x]!=0).item() == 0:
-                    room_label = 0
-                else:
-                    room_label = torch.where(self.room_map[0, :, map_y, map_x]!=0)[0][0].item()
-            else:
-                room_label = 0
-            if node.room_node is not self.room_nodes[room_label]:
-                if node.room_node is not None:
-                    node.room_node.nodes.discard(node)
-                node.room_node = self.room_nodes[room_label]
-                node.room_node.nodes.add(node)
+            room_node, membership_score, containment_ratio = self.assign_room_node_by_containment(
+                node,
+                points,
+            )
+            self.set_node_room(
+                node,
+                room_node,
+                membership_score=membership_score,
+                containment_ratio=containment_ratio,
+            )
             if node.caption in self.obj_goal_sg:
                 node.is_goal_node = True
 
@@ -891,21 +1136,69 @@ Final probability:'''
         return relations
 
     def update_group(self):
+        total_groups = 0
+        total_group_edges = 0
+        total_group_room_edges = 0
         for room_node in self.room_nodes:
-            if len(room_node.nodes) > 0:
-                room_node.group_nodes = []
-                object_nodes = list(room_node.nodes)
-                centers = [object_node.center for object_node in object_nodes]
-                centers = np.array(centers)
-                dbscan = DBSCAN(eps=10, min_samples=1)  
-                clusters = dbscan.fit_predict(centers)  
-                for i in range(clusters.max() + 1):
-                    group_node = GroupNode()
-                    indices = np.where(clusters == i)[0]
-                    for index in indices:
-                        group_node.nodes.append(object_nodes[index])
-                    group_node.get_graph()
-                    room_node.group_nodes.append(group_node)
+            room_node.group_nodes = []
+        self.group_nodes = []
+        object_nodes = [
+            node
+            for node in self.nodes
+            if getattr(node, "caption", None) and getattr(node, "center", None) is not None
+        ]
+        if len(object_nodes) == 0:
+            self.debug_stats.inc("paper_group_update")
+            return
+
+        adjacency = {node: set() for node in object_nodes}
+        object_node_set = set(object_nodes)
+        for node in object_nodes:
+            for edge in node.edges:
+                if not edge.relation:
+                    continue
+                other = edge.node2 if edge.node1 is node else edge.node1
+                if other not in object_node_set:
+                    continue
+                if not self.categories_related_for_group(node.caption, other.caption):
+                    continue
+                adjacency[node].add(other)
+                adjacency[other].add(node)
+                total_group_edges += 1
+
+        visited = set()
+        for node in object_nodes:
+            if node in visited or len(adjacency[node]) == 0:
+                continue
+            stack = [node]
+            component = []
+            visited.add(node)
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                for neighbor in adjacency[current]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+            if len(component) < 2:
+                continue
+
+            group_node = GroupNode()
+            group_node.nodes.extend(component)
+            group_node.get_graph()
+            component_room_list = [getattr(member, "room_node", None) for member in component]
+            component_rooms = {room for room in component_room_list if room is not None}
+            if len(component_rooms) == 1 and all(room is not None for room in component_room_list):
+                group_node.room_node = next(iter(component_rooms))
+                group_node.room_node.group_nodes.append(group_node)
+                total_group_room_edges += 1
+                group_node.get_graph()
+            self.group_nodes.append(group_node)
+            total_groups += 1
+        self.debug_stats.inc("paper_group_update")
+        self.debug_stats.inc("paper_group_count", total_groups)
+        self.debug_stats.inc("paper_group_related_edge_count", total_group_edges // 2)
+        self.debug_stats.inc("paper_group_room_edge_count", total_group_room_edges)
 
     def insert_goal(self, goal=None):
         self.debug_stats.inc("insert_goal_total")
@@ -974,29 +1267,36 @@ Final probability:'''
             self.score_refresh_bucket(),
             len(self.nodes),
             len(self.get_edges()),
+            self._room_graph_version,
         )
         if not force_refresh and cache_key in self._subgraph_score_cache_by_key:
             return self._subgraph_score_cache_by_key[cache_key]
 
         self.update_group()
         items = []
-        for room_node in self.room_nodes:
-            for group_node in room_node.group_nodes:
-                if len(group_node.nodes) == 0:
-                    continue
-                group_node.get_graph()
-                if group_node.center is None or group_node.center_node is None:
-                    continue
-                p_sub = float(self.graph_corr(goal, group_node))
-                p_sub = float(np.clip(p_sub, 0.0, 1.0))
-                items.append({
-                    "score": p_sub,
-                    "center_xy": np.array(group_node.center, dtype=np.float32),
-                    "center_node": group_node.center_node,
-                    "group_node": group_node,
-                    "room": getattr(room_node, "caption", ""),
-                    "caption": group_node.caption,
-                })
+        for group_node in self.group_nodes:
+            if len(group_node.nodes) == 0:
+                continue
+            group_node.get_graph()
+            if group_node.center is None or group_node.center_node is None:
+                continue
+            p_sub = float(self.graph_corr(goal, group_node))
+            p_sub = float(np.clip(p_sub, 0.0, 1.0))
+            room_node = getattr(group_node, "room_node", None)
+            items.append({
+                "score": p_sub,
+                "center_xy": np.array(group_node.center, dtype=np.float32),
+                "center_node": group_node.center_node,
+                "group_node": group_node,
+                "room": getattr(room_node, "caption", ""),
+                "caption": group_node.caption,
+                "pred_distance_m": getattr(group_node, "pred_distance_m", None),
+                "reason": getattr(group_node, "reason", ""),
+                "question": getattr(group_node, "question", ""),
+                "answer": getattr(group_node, "answer", ""),
+                "initial_distance_m": getattr(group_node, "initial_distance_m", None),
+                "initial_reason": getattr(group_node, "initial_reason", ""),
+            })
 
         self._subgraph_score_cache_key = cache_key
         self._subgraph_score_cache = items
@@ -1017,16 +1317,16 @@ Final probability:'''
             self.score_refresh_bucket(),
             len(self.nodes),
             len(self.get_edges()),
+            self._room_graph_version,
         )
         if not force_refresh and cache_key in self._subgraph_score_cache_by_key:
             return self._subgraph_score_cache_by_key[cache_key]
 
         self.update_group()
         group_by_node = {}
-        for room_node in self.room_nodes:
-            for group_node in room_node.group_nodes:
-                for node in group_node.nodes:
-                    group_by_node[node] = group_node
+        for group_node in self.group_nodes:
+            for grouped_node in group_node.nodes:
+                group_by_node[grouped_node] = group_node
 
         items = []
         for node in self.nodes:
@@ -1044,17 +1344,30 @@ Final probability:'''
             p_sub = float(self.graph_corr(goal, graph))
             p_sub = float(np.clip(p_sub, 0.0, 1.0))
             room_node = getattr(node, "room_node", None)
+            parent_edges_text = self.affiliation_edges_to_text(node, group_node, room_node)
+            graph_nodes_text = self.subgraph_nodes_to_text(node, group_node, room_node, neighbor_nodes)
+            graph_edges_text = ", ".join(
+                [text for text in [parent_edges_text, ", ".join(edge.text() for edge in edges)] if text]
+            )
             items.append({
                 "score": p_sub,
                 "center_xy": np.array(node.center, dtype=np.float32),
                 "center_node": node,
                 "group_node": group_node,
                 "room": getattr(room_node, "caption", ""),
-                "nodes_text": ", ".join([node.caption] + [n.caption for n in neighbor_nodes]),
-                "edges_text": ", ".join(edge.text() for edge in edges),
+                "nodes_text": graph_nodes_text,
+                "edges_text": graph_edges_text,
                 "caption": caption,
                 "object_confidence": self.node_confidence(node),
                 "observation_count": self.node_observation_count(node),
+                "room_membership_score": float(getattr(node, "room_membership_score", 0.0)),
+                "room_containment_ratio": float(getattr(node, "room_containment_ratio", 0.0)),
+                "pred_distance_m": getattr(graph, "pred_distance_m", None),
+                "reason": getattr(graph, "reason", ""),
+                "question": getattr(graph, "question", ""),
+                "answer": getattr(graph, "answer", ""),
+                "initial_distance_m": getattr(graph, "initial_distance_m", None),
+                "initial_reason": getattr(graph, "initial_reason", ""),
             })
 
         self._subgraph_score_cache_key = cache_key
@@ -1064,19 +1377,45 @@ Final probability:'''
         self.debug_stats.inc("paper_subgraph_count", len(items))
         return items
 
+    def subgraph_nodes_to_text(self, node, group_node, room_node, neighbor_nodes):
+        graph_nodes = [f"object:{node.caption}"]
+        if room_node is not None:
+            graph_nodes.append(f"room:{room_node.caption}")
+        if group_node is not None:
+            group_nodes = ", ".join(member.caption for member in group_node.nodes)
+            graph_nodes.append(f"group:({group_nodes})")
+        graph_nodes.extend(f"object:{neighbor.caption}" for neighbor in neighbor_nodes)
+        return ", ".join(graph_nodes)
+
+    def affiliation_edges_to_text(self, node, group_node, room_node):
+        edges = []
+        if room_node is not None:
+            edges.append(f"({node.caption}, belongs to, {room_node.caption})")
+        if group_node is not None and room_node is not None and group_node.room_node is room_node:
+            group_text = " and ".join(member.caption for member in group_node.nodes)
+            edges.append(f"({group_text}, belongs to, {room_node.caption})")
+        return ", ".join(edges)
+
     def object_subgraph_to_text(self, node, group_node, neighbor_nodes, edges):
-        room_name = getattr(getattr(node, "room_node", None), "caption", "unknown room")
+        room_node = getattr(node, "room_node", None)
+        room_name = getattr(room_node, "caption", "unknown room")
         group_text = getattr(group_node, "caption", "") if group_node is not None else ""
         neighbors_text = ", ".join(n.caption for n in neighbor_nodes) or "none"
-        edges_text = ", ".join(edge.text() for edge in edges) or "none"
+        object_edges_text = ", ".join(edge.text() for edge in edges)
+        parent_edges_text = self.affiliation_edges_to_text(node, group_node, room_node)
+        edges_text = ", ".join(
+            [text for text in [parent_edges_text, object_edges_text] if text]
+        ) or "none"
         confidence = self.node_confidence(node)
         observation_count = self.node_observation_count(node)
         return (
             f"Center object: {node.caption}. "
-            f"Room: {room_name}. "
+            f"Parent room node: {room_name}. "
             f"Group context: {group_text or 'none'}. "
             f"Connected objects: {neighbors_text}. "
             f"Edges: {edges_text}. "
+            f"Room membership score: {getattr(node, 'room_membership_score', 0.0):.3f}. "
+            f"Room containment ratio: {getattr(node, 'room_containment_ratio', 0.0):.3f}. "
             f"Object confidence: {confidence:.3f}. "
             f"Observation count: {observation_count}."
         )
@@ -1102,12 +1441,248 @@ Final probability:'''
         except Exception:
             return 0
 
+    def node_merge_priority(self, node):
+        point_count = len(self.pcd_points(node))
+        return (
+            self.node_observation_count(node),
+            self.node_confidence(node),
+            point_count,
+        )
+
+    def pcd_points(self, node):
+        obj = getattr(node, "object", None) or {}
+        pcd = obj.get("pcd")
+        if pcd is None:
+            return np.zeros((0, 3), dtype=np.float32)
+        try:
+            points = np.asarray(pcd.points, dtype=np.float32)
+        except Exception:
+            return np.zeros((0, 3), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 2:
+            return np.zeros((0, 3), dtype=np.float32)
+        return points
+
+    def node_xy_bounds_m(self, node):
+        points = self.pcd_points(node)
+        if len(points) == 0:
+            return None
+        xy = points[:, :2]
+        return np.min(xy, axis=0), np.max(xy, axis=0)
+
+    def bounds_iou_and_containment(self, bounds_a, bounds_b):
+        if bounds_a is None or bounds_b is None:
+            return 0.0, 0.0
+        min_a, max_a = bounds_a
+        min_b, max_b = bounds_b
+        inter_min = np.maximum(min_a, min_b)
+        inter_max = np.minimum(max_a, max_b)
+        inter_size = np.maximum(inter_max - inter_min, 0.0)
+        inter_area = float(inter_size[0] * inter_size[1])
+        area_a = float(np.prod(np.maximum(max_a - min_a, 0.0)))
+        area_b = float(np.prod(np.maximum(max_b - min_b, 0.0)))
+        if area_a <= 1e-8 or area_b <= 1e-8:
+            return 0.0, 0.0
+        iou = inter_area / max(area_a + area_b - inter_area, 1e-8)
+        containment = inter_area / max(min(area_a, area_b), 1e-8)
+        return float(iou), float(containment)
+
+    def deterministic_sample_points(self, points, max_points=128):
+        if len(points) <= max_points:
+            return points
+        stride = max(1, len(points) // max_points)
+        return points[::stride][:max_points]
+
+    def point_overlap_ratio(self, node_a, node_b):
+        points_a = self.deterministic_sample_points(self.pcd_points(node_a), 128)
+        points_b = self.deterministic_sample_points(self.pcd_points(node_b), 128)
+        if len(points_a) == 0 or len(points_b) == 0:
+            return 0.0
+        xy_a = points_a[:, :2]
+        xy_b = points_b[:, :2]
+        diff = xy_a[:, None, :] - xy_b[None, :, :]
+        dist2 = np.sum(diff * diff, axis=2)
+        threshold2 = self.duplicate_merge_point_distance_m() ** 2
+        overlap_a = float(np.mean(np.min(dist2, axis=1) <= threshold2))
+        overlap_b = float(np.mean(np.min(dist2, axis=0) <= threshold2))
+        return max(overlap_a, overlap_b)
+
+    def room_compatible_for_duplicate_merge(self, node_a, node_b):
+        room_a = getattr(node_a, "room_node", None)
+        room_b = getattr(node_b, "room_node", None)
+        return room_a is None or room_b is None or room_a is room_b
+
+    def node_map_distance_m(self, node_a, node_b):
+        if getattr(node_a, "center", None) is None or getattr(node_b, "center", None) is None:
+            return float("inf")
+        return float(
+            np.linalg.norm(
+                np.asarray(node_a.center, dtype=np.float32)
+                - np.asarray(node_b.center, dtype=np.float32)
+            )
+            * self.map_resolution
+            / 100.0
+        )
+
+    def should_merge_duplicate_nodes(self, node_a, node_b):
+        label_a = self.normalize_category(getattr(node_a, "caption", ""))
+        label_b = self.normalize_category(getattr(node_b, "caption", ""))
+        if not label_a or not label_b or label_a != label_b:
+            return False, {}
+        if not self.room_compatible_for_duplicate_merge(node_a, node_b):
+            return False, {"reason": "different_rooms"}
+
+        center_m = self.node_map_distance_m(node_a, node_b)
+        bounds_iou, bounds_containment = self.bounds_iou_and_containment(
+            self.node_xy_bounds_m(node_a),
+            self.node_xy_bounds_m(node_b),
+        )
+        point_overlap = self.point_overlap_ratio(node_a, node_b)
+        strong_center = center_m <= self.duplicate_merge_strong_center_m()
+        close_enough = center_m <= self.duplicate_merge_center_m()
+        geometry_overlap = (
+            point_overlap >= self.duplicate_merge_point_overlap()
+            or bounds_iou >= self.duplicate_merge_bbox_iou()
+            or bounds_containment >= self.duplicate_merge_bbox_containment()
+        )
+        accepted = bool(strong_center or (close_enough and geometry_overlap))
+        meta = {
+            "label": label_a,
+            "center_m": center_m,
+            "point_overlap": point_overlap,
+            "bbox_iou": bounds_iou,
+            "bbox_containment": bounds_containment,
+            "strong_center": bool(strong_center),
+            "close_enough": bool(close_enough),
+            "geometry_overlap": bool(geometry_overlap),
+        }
+        return accepted, meta
+
+    def find_edge_between(self, node_a, node_b):
+        for edge in node_a.edges:
+            if (edge.node1 is node_a and edge.node2 is node_b) or (
+                edge.node1 is node_b and edge.node2 is node_a
+            ):
+                return edge
+        return None
+
+    def remove_object_from_lists(self, obj):
+        if obj is None:
+            return
+        self.objects = MapObjectList([item for item in self.objects if item is not obj])
+        self.objects_post = MapObjectList(
+            [item for item in self.objects_post if item is not obj]
+        )
+
+    def merge_duplicate_node_pair(self, keep_node, duplicate_node, meta):
+        keep_obj = getattr(keep_node, "object", None)
+        duplicate_obj = getattr(duplicate_node, "object", None)
+        if keep_obj is None or duplicate_obj is None:
+            return
+        objects_merged = keep_obj is duplicate_obj
+        if keep_obj is not None and duplicate_obj is not None and keep_obj is not duplicate_obj:
+            try:
+                merge_obj2_into_obj1(self.cfg, keep_obj, duplicate_obj, run_dbscan=False)
+                keep_obj["node"] = keep_node
+                keep_node.object = keep_obj
+                objects_merged = True
+            except Exception as exc:
+                self.debug_stats.log_response(
+                    "object_duplicate_merge_error",
+                    prompt=str(meta),
+                    response=repr(exc),
+                )
+                return
+
+        if keep_node.room_node is None and duplicate_node.room_node is not None:
+            self.set_node_room(
+                keep_node,
+                duplicate_node.room_node,
+                membership_score=getattr(duplicate_node, "room_membership_score", 0.0),
+                containment_ratio=getattr(duplicate_node, "room_containment_ratio", 0.0),
+            )
+        keep_node.is_goal_node = bool(keep_node.is_goal_node or duplicate_node.is_goal_node)
+
+        for edge in list(duplicate_node.edges):
+            other = edge.node2 if edge.node1 is duplicate_node else edge.node1
+            relation = edge.relation
+            edge.delete()
+            if other is keep_node:
+                continue
+            existing_edge = self.find_edge_between(keep_node, other)
+            if existing_edge is not None:
+                if existing_edge.relation is None and relation is not None:
+                    existing_edge.set_relation(relation)
+                continue
+            new_edge = Edge(keep_node, other)
+            new_edge.set_relation(relation)
+
+        if duplicate_node.room_node is not None:
+            duplicate_node.room_node.nodes.discard(duplicate_node)
+        if duplicate_node in self.nodes:
+            self.nodes.remove(duplicate_node)
+        if objects_merged and duplicate_obj is not keep_obj:
+            self.remove_object_from_lists(duplicate_obj)
+        self.debug_stats.inc("object_duplicate_merged")
+        self.debug_stats.log_response(
+            "object_duplicate_merged",
+            prompt=f"{duplicate_node.caption} -> {keep_node.caption}",
+            response=json.dumps(meta, ensure_ascii=False),
+        )
+
+    def merge_duplicate_object_nodes(self):
+        if not self.duplicate_object_merge_enabled() or len(self.nodes) < 2:
+            return
+        total_merged = 0
+        for _ in range(self.duplicate_merge_max_passes()):
+            best_pair = None
+            best_meta = None
+            best_score = -1.0
+            for idx, node_a in enumerate(list(self.nodes)):
+                for node_b in list(self.nodes)[idx + 1:]:
+                    accepted, meta = self.should_merge_duplicate_nodes(node_a, node_b)
+                    self.debug_stats.inc("object_duplicate_merge_checks")
+                    if not accepted:
+                        continue
+                    score = (
+                        float(meta.get("point_overlap", 0.0))
+                        + float(meta.get("bbox_iou", 0.0))
+                        + float(meta.get("bbox_containment", 0.0))
+                    )
+                    if meta.get("strong_center", False):
+                        score += 1.0
+                    if score > best_score:
+                        best_score = score
+                        best_pair = (node_a, node_b)
+                        best_meta = meta
+            if best_pair is None:
+                break
+            node_a, node_b = best_pair
+            if self.node_merge_priority(node_b) > self.node_merge_priority(node_a):
+                keep_node, duplicate_node = node_b, node_a
+            else:
+                keep_node, duplicate_node = node_a, node_b
+            self.merge_duplicate_node_pair(keep_node, duplicate_node, best_meta or {})
+            total_merged += 1
+        if total_merged > 0:
+            self._subgraph_score_cache_by_key.clear()
+            self._subgraph_score_cache = []
+            self._subgraph_score_cache_key = None
+            self.debug_stats.inc("object_duplicate_merge_passes")
+            self.debug_stats.inc("object_duplicate_merge_total", total_merged)
+
     def score_frontiers_by_subgraphs(self, frontier_locations, goal):
         subgraphs = self.get_object_centered_subgraphs_for_goal(goal)
+        agent_args = getattr(getattr(self, "agent", None), "args", None)
+        score_norm = getattr(agent_args, "frontier_score_norm", "paper_sum")
         if len(subgraphs) == 0:
             self.last_score_debug = {
                 "mode": self.score_mode(),
+                "frontier_score_norm": score_norm,
                 "num_subgraphs": 0,
+                "room_nodes_active": int(sum(1 for room_node in self.room_nodes if room_node.active)),
+                "room_nodes_with_objects": int(sum(1 for room_node in self.room_nodes if len(room_node.nodes) > 0)),
+                "room_nodes_with_groups": int(sum(1 for room_node in self.room_nodes if len(room_node.group_nodes) > 0)),
+                "group_nodes_total": int(len(self.group_nodes)),
                 "frontier_score_min": 0.0,
                 "frontier_score_max": 0.0,
                 "frontier_score_mean": 0.0,
@@ -1127,11 +1702,19 @@ Final probability:'''
                 weight = 1.0 / d_m
                 score_sum += float(subgraph["score"]) * weight
                 weight_sum += weight
-            scores.append(score_sum / max(weight_sum, 1e-6))
+            if score_norm == "weighted_mean":
+                scores.append(score_sum / max(weight_sum, 1e-6))
+            else:
+                scores.append(score_sum)
         scores = np.asarray(scores, dtype=np.float32)
         self.last_score_debug = {
             "mode": self.score_mode(),
+            "frontier_score_norm": score_norm,
             "num_subgraphs": int(len(subgraphs)),
+            "room_nodes_active": int(sum(1 for room_node in self.room_nodes if room_node.active)),
+            "room_nodes_with_objects": int(sum(1 for room_node in self.room_nodes if len(room_node.nodes) > 0)),
+            "room_nodes_with_groups": int(sum(1 for room_node in self.room_nodes if len(room_node.group_nodes) > 0)),
+            "group_nodes_total": int(len(self.group_nodes)),
             "frontier_score_min": float(np.min(scores)) if len(scores) else 0.0,
             "frontier_score_max": float(np.max(scores)) if len(scores) else 0.0,
             "frontier_score_mean": float(np.mean(scores)) if len(scores) else 0.0,
@@ -1142,6 +1725,73 @@ Final probability:'''
             response=json.dumps(self.last_score_debug),
         )
         return scores
+
+    def explain_frontier_selection(self, frontier_location, goal, top_k=3):
+        subgraphs = self.get_object_centered_subgraphs_for_goal(goal)
+        if len(subgraphs) == 0 or frontier_location is None:
+            explanation = {
+                "selected_frontier_rc": None,
+                "nearest_subgraphs": [],
+                "explanation": "No scored subgraphs are available for explaining this frontier.",
+            }
+            self.reason_visualization = explanation["explanation"]
+            return explanation
+
+        frontier = np.asarray(frontier_location, dtype=np.float32)
+        nearest = []
+        for subgraph in subgraphs:
+            center_xy = np.asarray(subgraph["center_xy"], dtype=np.float32)
+            dist_m = float(np.linalg.norm(frontier - center_xy) * self.map_resolution / 100.0)
+            center_node = subgraph.get("center_node")
+            nearest.append({
+                "center_object": getattr(center_node, "caption", ""),
+                "room": subgraph.get("room", ""),
+                "room_membership_score": subgraph.get("room_membership_score", 0.0),
+                "room_containment_ratio": subgraph.get("room_containment_ratio", 0.0),
+                "frontier_distance_m": dist_m,
+                "score": float(subgraph.get("score", 0.0)),
+                "predicted_goal_distance_m": subgraph.get("pred_distance_m"),
+                "question": subgraph.get("question", ""),
+                "answer": subgraph.get("answer", ""),
+                "reason": subgraph.get("reason", ""),
+                "nodes": subgraph.get("nodes_text", ""),
+                "edges": subgraph.get("edges_text", ""),
+            })
+        nearest = sorted(nearest, key=lambda item: item["frontier_distance_m"])[:top_k]
+        prompt_payload = json.dumps(nearest, ensure_ascii=False)
+        prompt = self.prompt_frontier_explanation.format(goal, prompt_payload)
+        self.debug_stats.inc("frontier_explanation_total")
+        response = self.get_llm_response(
+            prompt=prompt,
+            request_type="frontier_explanation",
+            max_tokens=96,
+            response_format={"type": "json_object"},
+        )
+        data = extract_json(response)
+        if isinstance(data, dict) and data.get("explanation"):
+            explanation_text = strip_thinking(str(data["explanation"]))
+        else:
+            explanation_text = strip_thinking(response)
+        if not explanation_text:
+            fragments = []
+            for item in nearest:
+                fragments.append(
+                    f"{item['center_object']} in {item['room']} has score "
+                    f"{item['score']:.3f} near the selected frontier"
+                )
+            explanation_text = "; ".join(fragments)
+        explanation = {
+            "selected_frontier_rc": frontier.astype(int).tolist(),
+            "nearest_subgraphs": nearest,
+            "explanation": explanation_text,
+        }
+        self.reason_visualization = explanation_text
+        self.debug_stats.log_response(
+            "frontier_explanation_selected",
+            prompt=prompt,
+            response=json.dumps(explanation, ensure_ascii=False),
+        )
+        return explanation
 
     def fallback_room_by_cooccurrence(self):
         if not hasattr(self.agent, "prob_array_room"):
@@ -1166,6 +1816,7 @@ Final probability:'''
             self.mapping3d()
             self.get_caption()
             self.update_node()
+            self.merge_duplicate_object_nodes()
             if self.disable_llm_edges():
                 for node in self.nodes:
                     node.is_new_node = False
@@ -1570,15 +2221,16 @@ Final probability:'''
         prompt = self.prompt_graph_corr_0.format(graph.center_node.caption, goal)
         response_0 = self.get_llm_response(
             prompt=prompt,
-            request_type="graph_corr_probability",
-            max_tokens=16,
+            request_type="graph_corr_object_distance",
+            max_tokens=96,
             response_format={"type": "json_object"},
         )
-        initial_probability = self.parse_probability_response(
+        initial_distance = self.parse_distance_response(
             response_0,
             prompt,
-            "graph_corr_probability",
+            "graph_corr_object_distance",
         )
+        initial_reason = self.parse_reason_response(response_0)
         prompt = self.prompt_graph_corr_1.format(graph.center_node.caption, goal)
         response_1 = self.get_llm_response(
             prompt=prompt,
@@ -1592,23 +2244,62 @@ Final probability:'''
             max_tokens=96,
         )
         prompt = self.prompt_graph_corr_3.format(
-            f"{initial_probability:.3f}",
+            f"{initial_distance:.3f}",
             response_1 + response_2,
             graph.center_node.caption,
             goal,
         )
         response_3 = self.get_llm_response(
             prompt=prompt,
-            request_type="graph_corr_final",
-            max_tokens=16,
+            request_type="graph_corr_subgraph_distance",
+            max_tokens=96,
             response_format={"type": "json_object"},
         )
-        corr_score = self.parse_probability_response(
+        subgraph_distance = self.parse_distance_response(
             response_3,
             prompt,
-            "graph_corr_final",
+            "graph_corr_subgraph_distance",
         )
+        final_reason = self.parse_reason_response(response_3)
+        corr_score = float(np.clip(1.0 / max(subgraph_distance, 0.25), 0.0, 1.0))
+        graph.initial_distance_m = float(initial_distance)
+        graph.initial_reason = initial_reason
+        graph.question = strip_thinking(response_1)
+        graph.answer = strip_thinking(response_2)
+        graph.pred_distance_m = float(subgraph_distance)
+        graph.reason = final_reason
+        graph.corr_score = corr_score
         return corr_score
+
+    def parse_distance_response(self, response, prompt, request_type):
+        self.debug_stats.inc("distance_parse_total")
+        value = parse_distance_m(response, default=10.0)
+        if self.distance_parse_failed(response):
+            self.debug_stats.inc("distance_parse_fail")
+            self.debug_stats.log_response(
+                request_type=request_type + "_parse_fail",
+                prompt=prompt,
+                response=response,
+            )
+        return value
+
+    def distance_parse_failed(self, response):
+        data = extract_json(response)
+        if isinstance(data, dict):
+            for key in ["distance", "distance_m", "meters", "metres", "value", "answer"]:
+                if key in data:
+                    return self.distance_parse_failed(str(data[key]))
+        elif isinstance(data, (int, float)):
+            return False
+        return re.search(r"[-+]?\d*\.\d+|[-+]?\d+", strip_thinking(response)) is None
+
+    def parse_reason_response(self, response):
+        data = extract_json(response)
+        if isinstance(data, dict):
+            for key in ["reason", "explanation", "analysis", "answer"]:
+                if key in data:
+                    return strip_thinking(str(data[key]))
+        return strip_thinking(response)
 
     def parse_probability_response(self, response, prompt, request_type):
         self.debug_stats.inc("probability_parse_total")

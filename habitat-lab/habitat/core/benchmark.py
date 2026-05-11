@@ -145,6 +145,8 @@ class Benchmark:
         all_metrics_0 = []
         all_metrics_avg = []
         count_success = 0
+        count_valid_episodes = 0
+        count_invalid_episodes = 0
         agent.simulator = self
         while count_episodes < num_episodes:
             observations = self._env.reset()
@@ -158,23 +160,33 @@ class Benchmark:
                 observations = self._env.step(action)
                 agent.update_metrics(self._env.get_metrics())
 
-            metrics = self._env.get_metrics()
+            eval_metrics = dict(self._env.get_metrics())
+            metrics = dict(eval_metrics)
             metrics['goal'] = agent.obj_goal
             metrics['steps'] = agent.total_steps
             metrics['stop_reason'] = getattr(agent, 'stop_reason', '')
+            metrics['invalid_episode'] = bool(getattr(agent, 'invalid_episode', False))
+            metrics['invalid_episode_reason'] = getattr(agent, 'invalid_episode_reason', '')
             all_metrics.append(metrics)
-            metrics = self._env.get_metrics()
-            print(count_episodes, metrics)
-            if metrics['success'] == 1:
-                count_success += 1
-            for m, v in metrics.items():
-                if isinstance(v, dict):
-                    for sub_m, sub_v in v.items():
-                        agg_metrics[m + "/" + str(sub_m)] += sub_v
-                else:
-                    agg_metrics[m] += v
+            print(count_episodes, eval_metrics)
+            if metrics['invalid_episode']:
+                count_invalid_episodes += 1
+            else:
+                count_valid_episodes += 1
+                if eval_metrics['success'] == 1:
+                    count_success += 1
+                for m, v in eval_metrics.items():
+                    if isinstance(v, dict):
+                        for sub_m, sub_v in v.items():
+                            agg_metrics[m + "/" + str(sub_m)] += sub_v
+                    else:
+                        agg_metrics[m] += v
             count_episodes += 1
-            avg_metrics = {k: v / count_episodes for k, v in agg_metrics.items()}
+            avg_denominator = max(1, count_valid_episodes)
+            avg_metrics = {k: v / avg_denominator for k, v in agg_metrics.items()}
+            avg_metrics['valid_episodes'] = count_valid_episodes
+            avg_metrics['invalid_episodes'] = count_invalid_episodes
+            avg_metrics['processed_episodes'] = count_episodes
             all_metrics_avg.append(avg_metrics)
             for k,v in avg_metrics.items():
                 logger.info("{}: {}".format(k, v))
@@ -203,7 +215,11 @@ class Benchmark:
             
             
             
-        avg_metrics = {k: v / count_episodes for k, v in agg_metrics.items()}
+        avg_denominator = max(1, count_valid_episodes)
+        avg_metrics = {k: v / avg_denominator for k, v in agg_metrics.items()}
+        avg_metrics['valid_episodes'] = count_valid_episodes
+        avg_metrics['invalid_episodes'] = count_invalid_episodes
+        avg_metrics['processed_episodes'] = count_episodes
 
         return avg_metrics
 
