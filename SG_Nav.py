@@ -109,6 +109,10 @@ class SG_Nav_Agent():
         self.former_collide = 0
         self.history_pose = []
         self.visualize_image_list = []
+        self.current_visual_detections = []
+        self.frontier_locations = np.empty((0, 2), dtype=np.float32)
+        self.frontier_locations_16 = np.empty((0, 2), dtype=np.float32)
+        self.last_selected_frontier_rc = None
         self.realtime_monitor = bool(getattr(self.args, "realtime_monitor", False))
         self.realtime_monitor_every = max(
             1, int(getattr(self.args, "realtime_monitor_every", 1))
@@ -187,6 +191,53 @@ class SG_Nav_Agent():
         self.candidate_progress_min_delta_m = max(
             0.0, float(getattr(self.args, "candidate_progress_min_delta_m", 0.10))
         )
+        self.local_stg_collision_recovery_enabled = bool(
+            int(getattr(self.args, "local_stg_collision_recovery_enabled", 1))
+        )
+        self.local_stg_collision_threshold = max(
+            1, int(getattr(self.args, "local_stg_collision_threshold", 3))
+        )
+        self.local_stg_collision_radius_cells = max(
+            1, int(getattr(self.args, "local_stg_collision_radius_cells", 4))
+        )
+        self.local_stg_collision_ttl_steps = max(
+            1, int(getattr(self.args, "local_stg_collision_ttl_steps", 20))
+        )
+        self.local_stg_collision_same_tolerance_cells = max(
+            0.0,
+            float(getattr(self.args, "local_stg_collision_same_tolerance_cells", 2.0)),
+        )
+        self.local_stg_collision_stg_rc = None
+        self.local_stg_collision_count = 0
+        self.local_stg_collision_blocks = []
+        self.frontier_blacklist_enabled = bool(
+            int(getattr(self.args, "frontier_blacklist_enabled", 1))
+        )
+        self.frontier_blacklist_radius_m = max(
+            0.1, float(getattr(self.args, "frontier_blacklist_radius_m", 1.5))
+        )
+        self.frontier_blacklist_ttl_steps = max(
+            1, int(getattr(self.args, "frontier_blacklist_ttl_steps", 120))
+        )
+        self.frontier_blacklist_collision_blocks = max(
+            1, int(getattr(self.args, "frontier_blacklist_collision_blocks", 3))
+        )
+        self.frontier_blacklist_no_progress_steps = max(
+            1, int(getattr(self.args, "frontier_blacklist_no_progress_steps", 35))
+        )
+        self.frontier_progress_min_delta_m = max(
+            0.0, float(getattr(self.args, "frontier_progress_min_delta_m", 0.10))
+        )
+        self.frontier_blacklist = []
+        self.frontier_goal_invalidated = False
+        self.frontier_progress_goal_rc = None
+        self.frontier_progress_best_distance_m = float("inf")
+        self.frontier_progress_no_improve_steps = 0
+        self.frontier_collision_goal_rc = None
+        self.frontier_collision_block_count = 0
+        self.last_short_term_goal_rc = None
+        self.last_short_term_goal_action = 0
+        self.last_short_term_goal_step = -1
         self.invalid_episode_stuck_steps = max(
             0, int(getattr(self.args, "invalid_episode_stuck_steps", 200))
         )
@@ -234,6 +285,17 @@ class SG_Nav_Agent():
                 )
             ),
         )
+        self.near_goal_force_stop_enabled = bool(
+            int(getattr(self.args, "near_goal_force_stop_enabled", 1))
+        )
+        self.near_goal_force_stop_distance_m = max(
+            0.05,
+            float(getattr(self.args, "near_goal_force_stop_distance_m", 1.0)),
+        )
+        self.near_goal_force_stop_min_approach_steps = max(
+            0,
+            int(getattr(self.args, "near_goal_force_stop_min_approach_steps", 12)),
+        )
         self.stop_verification_anchor_radius_m = float(
             getattr(
                 self.args,
@@ -273,10 +335,10 @@ class SG_Nav_Agent():
             0, int(getattr(self.args, "direct_goal_approach_max_steps", 20))
         )
         self.goal_detection_min_confidence = float(
-            getattr(self.args, "goal_detection_min_confidence", 0.60)
+            getattr(self.args, "goal_detection_min_confidence", 0.62)
         )
         self.candidate_start_min_confidence = float(
-            getattr(self.args, "candidate_start_min_confidence", 0.60)
+            getattr(self.args, "candidate_start_min_confidence", 0.62)
         )
         self.planned_goal_approach_enabled = bool(
             int(getattr(self.args, "planned_goal_approach_enabled", 1))
@@ -322,14 +384,14 @@ class SG_Nav_Agent():
         )
         self.planned_goal_retreat_min_radius_m = max(
             0.05,
-            float(getattr(self.args, "planned_goal_retreat_min_radius_m", 1.20)),
+            float(getattr(self.args, "planned_goal_retreat_min_radius_m", 1.00)),
         )
         self.planned_goal_retreat_max_radius_m = max(
             self.planned_goal_retreat_min_radius_m,
             float(getattr(self.args, "planned_goal_retreat_max_radius_m", 1.50)),
         )
         self.planned_goal_retreat_require_line_of_sight = bool(
-            int(getattr(self.args, "planned_goal_retreat_require_line_of_sight", 1))
+            int(getattr(self.args, "planned_goal_retreat_require_line_of_sight", 0))
         )
         self.planned_goal_retreat_los_endpoint_skip_cells = max(
             0,
@@ -365,7 +427,7 @@ class SG_Nav_Agent():
             candidate_strong_evidence_min_hits = getattr(
                 self.args,
                 "candidate_strong_evidence_min_consecutive_hits",
-                6,
+                3,
             )
         self.candidate_strong_evidence_min_hits = max(
             1, int(candidate_strong_evidence_min_hits)
@@ -450,7 +512,10 @@ class SG_Nav_Agent():
         self.glip_demo = GLIPDemo(
             glip_cfg,
             min_image_size=800,
-            confidence_threshold=0.61,
+            confidence_threshold=min(
+                self.goal_detection_min_confidence,
+                self.candidate_start_min_confidence,
+            ),
             show_mask_heatmaps=False
         )
         startup_log("GLIP init done")
@@ -605,6 +670,10 @@ class SG_Nav_Agent():
         elif self.obj_goal == 'tv_monitor':
             self.obj_goal_sg = 'tv'
         self.current_obj_predictions = []
+        self.current_visual_detections = []
+        self.frontier_locations = np.empty((0, 2), dtype=np.float32)
+        self.frontier_locations_16 = np.empty((0, 2), dtype=np.float32)
+        self.last_selected_frontier_rc = None
         self.obj_locations = [[] for i in range(21)]
         self.not_move_steps = 0
         self.move_since_random = 0
@@ -623,6 +692,19 @@ class SG_Nav_Agent():
         self.invalid_episode_stationary_steps = 0
         self.invalid_episode_stationary_anchor_gps = None
         self.stuck_position_blacklist = []
+        self.local_stg_collision_stg_rc = None
+        self.local_stg_collision_count = 0
+        self.local_stg_collision_blocks = []
+        self.frontier_blacklist = []
+        self.frontier_goal_invalidated = False
+        self.frontier_progress_goal_rc = None
+        self.frontier_progress_best_distance_m = float("inf")
+        self.frontier_progress_no_improve_steps = 0
+        self.frontier_collision_goal_rc = None
+        self.frontier_collision_block_count = 0
+        self.last_short_term_goal_rc = None
+        self.last_short_term_goal_action = 0
+        self.last_short_term_goal_step = -1
         self.explanation = ''
         self.last_frontier_explanation = {}
         self.text_node = ''
@@ -1285,6 +1367,38 @@ class SG_Nav_Agent():
         if target_gps is None:
             return False
         if reason in {"blacklist_candidate_stuck", "blacklist_candidate_no_progress"}:
+            strong_evidence = self.current_candidate_has_strong_historical_evidence()
+            should_verify_progress_issue = bool(
+                strong_evidence
+                or (
+                    reason == "blacklist_candidate_no_progress"
+                    and self.current_candidate_hit_count() > 0
+                )
+            )
+            if should_verify_progress_issue:
+                event_name = (
+                    "strong_historical_evidence_verify"
+                    if strong_evidence
+                    else "candidate_no_progress_viewpoint_search"
+                )
+                verify_reason = (
+                    f"{reason}_strong_historical_evidence"
+                    if strong_evidence
+                    else "candidate_no_progress_viewpoint_search"
+                )
+                if self.promote_candidate_to_stop_verification(
+                    reason=verify_reason,
+                    target_gps=target_gps,
+                    distance_m=distance_m,
+                    event_name=event_name,
+                    debug_counter=event_name,
+                ):
+                    self.reset_candidate_progress_tracking()
+                    self.not_move_steps = 0
+                    self.scenegraph.debug_stats.inc(
+                        f"{reason}_promoted_to_verification"
+                    )
+                    return True
             if self.protect_near_hit_candidate_from_progress_reject(
                 reason, target_gps, distance_m
             ):
@@ -2297,7 +2411,7 @@ class SG_Nav_Agent():
         direct_goal_confirm_ready = bool(
             direct_goal_ready or not self.candidate_require_direct_goal_for_confirm
         )
-        evidence_ready = hit_ready
+        evidence_ready = bool(hit_ready and view_ready and hit_ratio_ready)
         history_item.update({
             "hit_count": int(self.current_candidate_hit_count()),
             "miss_count": int(self.current_candidate_miss_count()),
@@ -2737,6 +2851,213 @@ class SG_Nav_Agent():
         hfov = self.config.SIMULATOR.RGB_SENSOR.HFOV
         return float((x - width / 2) * hfov / width)
 
+    def cache_visual_detection(
+        self,
+        bbox,
+        label,
+        score,
+        *,
+        source="glip",
+        is_goal=False,
+        accepted=True,
+    ):
+        try:
+            if torch.is_tensor(bbox):
+                box = bbox.detach().cpu().numpy()
+            else:
+                box = np.asarray(bbox)
+            box = box.astype(float).reshape(-1)[:4]
+            if box.size != 4 or not np.all(np.isfinite(box)):
+                return
+            score_value = self.confidence_to_float(score)
+        except Exception:
+            return
+        self.current_visual_detections.append({
+            "bbox": box.tolist(),
+            "label": str(label),
+            "score": float(score_value),
+            "source": str(source),
+            "is_goal": bool(is_goal),
+            "accepted": bool(accepted),
+            "step": int(self.total_steps),
+        })
+
+    def observation_with_visual_overlays(self):
+        image = np.asarray(self.rgb_visualization).copy()
+        if image.ndim != 3 or image.shape[2] != 3:
+            return image
+        height, width = image.shape[:2]
+        detections = [
+            item
+            for item in list(getattr(self, "current_visual_detections", []))[-30:]
+            if int(item.get("step", -1)) == int(self.total_steps)
+        ]
+        for detection in detections:
+            try:
+                x1, y1, x2, y2 = [
+                    int(round(value)) for value in detection.get("bbox", [])
+                ]
+            except Exception:
+                continue
+            x1 = max(0, min(width - 1, x1))
+            x2 = max(0, min(width - 1, x2))
+            y1 = max(0, min(height - 1, y1))
+            y2 = max(0, min(height - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            is_goal = bool(detection.get("is_goal", False))
+            accepted = bool(detection.get("accepted", True))
+            color = (255, 0, 0) if is_goal and accepted else (255, 170, 0)
+            if is_goal and not accepted:
+                color = (170, 170, 170)
+            thickness = 3 if is_goal and accepted else 2
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+            label = str(detection.get("label", "det"))
+            score = float(detection.get("score", 0.0) or 0.0)
+            text = f"{label} {score:.2f}"
+            text_y = max(18, y1 - 6)
+            cv2.putText(
+                image,
+                text[:36],
+                (x1, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+            if is_goal and accepted:
+                center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                cv2.circle(image, center, 7, (255, 0, 0), -1)
+                cv2.circle(image, center, 10, (255, 255, 255), 2)
+
+        if getattr(self, "found_possible_goal", False):
+            cv2.circle(image, (22, 24), 8, (255, 0, 0), -1)
+            cv2.putText(
+                image,
+                "possible goal",
+                (38, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            visibility = self.candidate_visibility_for_miss(
+                getattr(self, "current_observations", None),
+                getattr(self, "possible_goal_temp_gps", None),
+                max_distance_m=None,
+                fov_margin_deg=0.0,
+            )
+            projected_x = visibility.get("projected_x")
+            try:
+                projected_x = int(round(float(projected_x)))
+            except Exception:
+                projected_x = None
+            if projected_x is not None and 0 <= projected_x < width:
+                marker_y = height // 2
+                cv2.circle(image, (projected_x, marker_y), 10, (255, 0, 0), -1)
+                cv2.circle(image, (projected_x, marker_y), 14, (255, 255, 255), 2)
+                distance_m = visibility.get("distance_m")
+                try:
+                    distance_text = f"{float(distance_m):.2f}m"
+                except Exception:
+                    distance_text = "?m"
+                cv2.putText(
+                    image,
+                    f"possible {distance_text}",
+                    (max(0, projected_x - 55), max(22, marker_y - 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 0, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+        return image
+
+    def draw_gps_marker_on_map(
+        self,
+        map_tensor,
+        gps,
+        color=(1.0, 0.0, 0.0),
+        radius=5,
+    ):
+        try:
+            gps = np.asarray(gps, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            return
+        if gps.size != 2 or not np.all(np.isfinite(gps)):
+            return
+        row = int((self.map_size_cm / 200 + gps[1]) * 100 / self.resolution)
+        col = int((self.map_size_cm / 200 + gps[0]) * 100 / self.resolution)
+        height = int(map_tensor.shape[1])
+        width = int(map_tensor.shape[2])
+        if row < 0 or row >= height or col < 0 or col >= width:
+            return
+        r0 = max(0, row - radius)
+        r1 = min(height, row + radius + 1)
+        c0 = max(0, col - radius)
+        c1 = min(width, col + radius + 1)
+        map_tensor[:, r0:r1, c0:c1] = 0
+        for channel, value in enumerate(color):
+            map_tensor[channel, r0:r1, c0:c1] = float(value)
+
+    def draw_rc_marker_on_map(
+        self,
+        map_tensor,
+        rc,
+        color=(0.0, 0.0, 0.0),
+        radius=2,
+    ):
+        try:
+            rc = np.asarray(rc, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            return
+        if rc.size != 2 or not np.all(np.isfinite(rc)):
+            return
+        height = int(map_tensor.shape[1])
+        width = int(map_tensor.shape[2])
+        row = height - 1 - int(round(float(rc[0])))
+        col = int(round(float(rc[1])))
+        if row < 0 or row >= height or col < 0 or col >= width:
+            return
+        r0 = max(0, row - radius)
+        r1 = min(height, row + radius + 1)
+        c0 = max(0, col - radius)
+        c1 = min(width, col + radius + 1)
+        map_tensor[:, r0:r1, c0:c1] = 0
+        for channel, value in enumerate(color):
+            map_tensor[channel, r0:r1, c0:c1] = float(value)
+
+    def draw_unselected_frontiers_on_map(self, map_tensor):
+        frontiers = getattr(self, "frontier_locations_16", None)
+        if frontiers is None:
+            return
+        try:
+            frontiers = np.asarray(frontiers, dtype=np.float32).reshape(-1, 2)
+        except Exception:
+            return
+        if frontiers.size == 0:
+            return
+        selected = getattr(self, "last_selected_frontier_rc", None)
+        if selected is None:
+            selected = getattr(self, "goal_loc", None)
+        try:
+            selected = np.asarray(selected, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            selected = None
+        for frontier in frontiers:
+            rc = frontier - 1
+            if selected is not None and selected.size == 2:
+                if np.linalg.norm(rc - selected) <= 1.5:
+                    continue
+            self.draw_rc_marker_on_map(
+                map_tensor,
+                rc,
+                color=(0.0, 0.0, 0.0),
+                radius=2,
+            )
+
     def get_goal_node_support(self, goal_gps):
         if self.stop_verification_goal_node_radius_m <= 0:
             return {"supported": True, "best": None}
@@ -2766,6 +3087,7 @@ class SG_Nav_Agent():
         }
 
     def observe_stop_verification(self, observations):
+        self.current_visual_detections = []
         prediction = self.glip_demo.inference(
             observations["rgb"][:, :, [2, 1, 0]],
             object_captions,
@@ -2780,6 +3102,14 @@ class SG_Nav_Agent():
             if not self.goal_label_matches(label):
                 continue
             score = self.confidence_to_float(scores[idx])
+            self.cache_visual_detection(
+                prediction.bbox[idx],
+                label,
+                score,
+                source="stop_verification",
+                is_goal=True,
+                accepted=score >= self.goal_detection_min_confidence,
+            )
             if score < self.goal_detection_min_confidence:
                 self.scenegraph.debug_stats.inc(
                     "stop_verification_low_confidence_skipped"
@@ -3663,6 +3993,12 @@ class SG_Nav_Agent():
         cumulative_evidence_hits = (
             candidate_evidence_hits + verification_evidence_hits
         )
+        current_verified_hit = bool(hit)
+        current_near_verified_hit = bool(
+            current_verified_hit
+            and self.stop_verification_history
+            and self.stop_verification_history[-1].get("near_hit", False)
+        )
         candidate_direct_goal_count = (
             self.current_candidate_direct_goal_contribution_count()
         )
@@ -3677,8 +4013,7 @@ class SG_Nav_Agent():
             best_detection_score = 0.0
         high_confidence_current_hit = bool(
             close_to_target
-            and hit
-            and near_visual_hits > 0
+            and current_near_verified_hit
             and best_detection_score >= self.stop_verification_force_stop_confidence
         )
         historical_candidate_supported = bool(
@@ -3691,14 +4026,26 @@ class SG_Nav_Agent():
         weak_historical_stop = bool(
             historical_candidate_supported
             and cumulative_evidence_hits >= self.stop_verification_min_hits
+            and current_verified_hit
             and self.stop_verification_observation_count >= max(1, self.stop_verification_steps)
         )
         enough_hits = cumulative_evidence_hits >= self.stop_verification_min_hits
+        current_verified_stop_evidence = bool(
+            current_verified_hit
+            and enough_hits
+            and (
+                (not self.stop_require_near_visual_hit)
+                or current_near_verified_hit
+            )
+        )
         retreat_confirmed_evidence = bool(
             getattr(self, "planned_goal_retreat_confirmed", False)
         )
+        near_hit_stop_evidence = bool(
+            current_verified_stop_evidence and current_near_verified_hit
+        )
         raw_enough_evidence = bool(
-            enough_hits
+            current_verified_stop_evidence
             or high_confidence_current_hit
             or strong_consecutive_evidence
             or retreat_confirmed_evidence
@@ -3706,7 +4053,7 @@ class SG_Nav_Agent():
         )
         near_visual_hit_ready = bool(
             (not self.stop_require_near_visual_hit)
-            or near_visual_hits > 0
+            or current_near_verified_hit
             or strong_consecutive_evidence
             or high_confidence_current_hit
             or retreat_confirmed_evidence
@@ -3800,6 +4147,9 @@ class SG_Nav_Agent():
             self.stop_verification_history[-1]["verification_near_hits"] = (
                 int(verification_near_hits)
             )
+            self.stop_verification_history[-1]["current_near_verified_hit"] = (
+                bool(current_near_verified_hit)
+            )
             self.stop_verification_history[-1]["near_visual_hits"] = (
                 int(near_visual_hits)
             )
@@ -3822,6 +4172,9 @@ class SG_Nav_Agent():
                 bool(enough_evidence)
             )
             self.stop_verification_history[-1]["enough_hits"] = bool(enough_hits)
+            self.stop_verification_history[-1][
+                "current_verified_stop_evidence"
+            ] = bool(current_verified_stop_evidence)
             self.stop_verification_history[-1][
                 "raw_enough_evidence"
             ] = bool(raw_enough_evidence)
@@ -3858,6 +4211,9 @@ class SG_Nav_Agent():
             self.stop_verification_history[-1][
                 "planned_goal_retreat_confirmed"
             ] = bool(retreat_confirmed_evidence)
+            self.stop_verification_history[-1][
+                "near_hit_stop_evidence"
+            ] = bool(near_hit_stop_evidence)
             self.stop_verification_history[-1][
                 "verification_observation_count"
             ] = int(self.stop_verification_observation_count)
@@ -3926,10 +4282,7 @@ class SG_Nav_Agent():
             retreat_ready_for_reapproach = bool(
                 planned_station_kind == "retreat"
                 and planned_arrived
-                and (
-                    retreat_viewpoint_hit
-                    or strong_consecutive_evidence
-                )
+                and retreat_viewpoint_hit
             )
             if self.stop_verification_history:
                 self.stop_verification_history[-1][
@@ -3938,6 +4291,7 @@ class SG_Nav_Agent():
 
             if retreat_ready_for_reapproach:
                 self.planned_goal_retreat_active = False
+                self.planned_goal_retreat_confirmed = True
                 self.planned_goal_retreat_steps = 0
                 self.planned_goal_retreat_blocked_steps = 0
                 self.planned_goal_retreat_scan_steps_taken = 0
@@ -3946,11 +4300,7 @@ class SG_Nav_Agent():
                 self.planned_goal_approach_blocked_steps = 0
                 self.planned_goal_arrival_scan_steps_taken = 0
                 self.stop_verification_consecutive_failures = 0
-                self.stop_reason = (
-                    "planned_goal_retreat_hit_reapproach"
-                    if retreat_viewpoint_hit_at_station
-                    else "planned_goal_retreat_strong_evidence_reapproach"
-                )
+                self.stop_reason = "planned_goal_retreat_hit_reapproach"
                 self.scenegraph.debug_stats.inc(
                     self.stop_reason
                 )
@@ -4004,7 +4354,72 @@ class SG_Nav_Agent():
                 )
                 return False, self.stop_verification_turn_action
 
-            if enough_evidence and close_to_target:
+            retreat_state_blocks_stop = bool(planned_station_kind == "retreat")
+            if self.stop_verification_history:
+                self.stop_verification_history[-1][
+                    "planned_goal_retreat_state_blocks_stop"
+                ] = bool(retreat_state_blocks_stop)
+
+            current_verified_hit = bool(hit)
+            stop_decision_supported = bool(
+                current_verified_stop_evidence
+                or strong_consecutive_evidence
+                or retreat_confirmed_evidence
+                or high_confidence_current_hit
+            )
+            stop_ready_evidence = bool(enough_evidence and stop_decision_supported)
+            near_goal_force_stop_approach_mature = bool(
+                self.planned_goal_approach_steps
+                >= self.near_goal_force_stop_min_approach_steps
+            )
+            near_goal_force_stop_supported = bool(stop_ready_evidence)
+            near_goal_force_stop_ready = bool(
+                self.near_goal_force_stop_enabled
+                and planned_station_kind == "approach"
+                and not retreat_state_blocks_stop
+                and target_distance <= self.near_goal_force_stop_distance_m
+                and near_goal_force_stop_supported
+                and (close_to_target or near_goal_force_stop_approach_mature)
+            )
+            if self.stop_verification_history:
+                self.stop_verification_history[-1][
+                    "near_goal_force_stop_enabled"
+                ] = bool(self.near_goal_force_stop_enabled)
+                self.stop_verification_history[-1][
+                    "near_goal_force_stop_ready"
+                ] = bool(near_goal_force_stop_ready)
+                self.stop_verification_history[-1][
+                    "near_goal_force_stop_supported"
+                ] = bool(near_goal_force_stop_supported)
+                self.stop_verification_history[-1][
+                    "near_goal_force_stop_approach_mature"
+                ] = bool(near_goal_force_stop_approach_mature)
+                self.stop_verification_history[-1][
+                    "near_goal_force_stop_distance_m"
+                ] = float(self.near_goal_force_stop_distance_m)
+                self.stop_verification_history[-1][
+                    "near_goal_force_stop_min_approach_steps"
+                ] = int(self.near_goal_force_stop_min_approach_steps)
+                self.stop_verification_history[-1][
+                    "current_verified_hit"
+                ] = bool(current_verified_hit)
+                self.stop_verification_history[-1][
+                    "stop_decision_supported"
+                ] = bool(stop_decision_supported)
+                self.stop_verification_history[-1][
+                    "stop_ready_evidence"
+                ] = bool(stop_ready_evidence)
+
+            if near_goal_force_stop_ready:
+                confirm_reason = "stop_verification_near_goal_force_stop"
+                self.finalize_candidate("confirm", confirm_reason)
+                self.stop_reason = confirm_reason
+                self.scenegraph.debug_stats.inc(confirm_reason)
+                self.scenegraph.debug_stats.inc("stop_verification_confirmed")
+                self.reset_stop_verification_state(clear_history=False)
+                return True, 0
+
+            if stop_ready_evidence and close_to_target and not retreat_state_blocks_stop:
                 confirm_reason = (
                     "stop_verification_high_confidence"
                     if high_confidence_current_hit
@@ -4022,7 +4437,7 @@ class SG_Nav_Agent():
 
             planned_verification_timed_out = bool(
                 close_to_target
-                and not enough_evidence
+                and not stop_ready_evidence
                 and self.stop_verification_observation_count
                 >= self.planned_goal_verification_max_observations
                 and self.planned_goal_retreat_attempts_exhausted()
@@ -4045,7 +4460,7 @@ class SG_Nav_Agent():
 
             if (
                 close_to_target
-                and not enough_evidence
+                and not stop_ready_evidence
                 and planned_station_kind == "retreat"
                 and self.planned_goal_retreat_scan_steps_taken
                 < self.planned_goal_retreat_scan_steps
@@ -4119,7 +4534,7 @@ class SG_Nav_Agent():
 
             if (
                 close_to_target
-                and not enough_evidence
+                and not stop_ready_evidence
                 and planned_station_kind == "retreat"
                 and self.planned_goal_retreat_scan_steps_taken
                 >= self.planned_goal_retreat_scan_steps
@@ -4144,7 +4559,7 @@ class SG_Nav_Agent():
 
             if (
                 close_to_target
-                and not enough_evidence
+                and not stop_ready_evidence
                 and planned_station_kind == "approach"
                 and self.planned_goal_arrival_scan_steps_taken
                 < self.planned_goal_arrival_scan_steps
@@ -4161,7 +4576,7 @@ class SG_Nav_Agent():
 
             if (
                 close_to_target
-                and not enough_evidence
+                and not stop_ready_evidence
                 and planned_station_kind == "approach"
                 and self.planned_goal_retreat_enabled
                 and self.planned_goal_retreat_max_steps > 0
@@ -4331,6 +4746,7 @@ class SG_Nav_Agent():
         return False, self.stop_verification_turn_action
         
     def detect_objects(self, observations):
+        self.current_visual_detections = []
         self.current_obj_predictions = self.glip_demo.inference(observations["rgb"][:,:,[2,1,0]], object_captions) # GLIP object detection, time cosuming
         new_labels = self.get_glip_real_label(self.current_obj_predictions) # transfer int labels to string labels
         self.current_obj_predictions.add_field("labels", new_labels)
@@ -4344,6 +4760,14 @@ class SG_Nav_Agent():
         for j, label in enumerate(obj_labels):
             score = self.confidence_to_float(obj_scores[j])
             if self.goal_label_matches(label):
+                self.cache_visual_detection(
+                    self.current_obj_predictions.bbox[j],
+                    label,
+                    score,
+                    source="glip_bbox",
+                    is_goal=True,
+                    accepted=score >= self.candidate_start_min_confidence,
+                )
                 if score < self.candidate_start_min_confidence:
                     self.scenegraph.debug_stats.inc(
                         "candidate_start_low_confidence_skipped"
@@ -4725,6 +5149,30 @@ class SG_Nav_Agent():
                 self.use_frontier_goal(self.goal_loc, reason="fbe_initial")
 
         if (
+            self.frontier_goal_invalidated
+            and not self.found_goal
+            and not self.found_possible_goal
+            and not self.reperception_active
+            and not self.stop_verification_active
+        ):
+            self.goal_loc = self.fbe(traversible, cur_start)
+            self.not_use_random_goal()
+            self.frontier_goal_invalidated = False
+            self.goal_map = np.zeros(self.full_map.shape[-2:])
+            if self.goal_loc is None:
+                self.random_this_ex += 1
+                self.record_random_goal("frontier_blacklist_no_valid_goal")
+                self.goal_map = self.set_random_goal(
+                    reason="frontier_blacklist_no_valid_goal"
+                )
+                self.using_random_goal = True
+            else:
+                self.use_frontier_goal(
+                    self.goal_loc,
+                    reason="frontier_blacklist_replan",
+                )
+
+        if (
             self.using_random_goal
             and not self.found_goal
             and not self.found_possible_goal
@@ -4757,6 +5205,31 @@ class SG_Nav_Agent():
         )
         if self.found_possible_goal and number_action == 0:
             self.scenegraph.debug_stats.inc("pending_candidate_arrival")
+        if self.maybe_blacklist_frontier_no_progress(cur_start):
+            self.goal_loc = self.fbe(traversible, cur_start)
+            self.not_use_random_goal()
+            self.frontier_goal_invalidated = False
+            self.goal_map = np.zeros(self.full_map.shape[-2:])
+            if self.goal_loc is None:
+                self.random_this_ex += 1
+                self.record_random_goal("frontier_no_progress_no_valid_goal")
+                self.goal_map = self.set_random_goal(
+                    reason="frontier_no_progress_no_valid_goal"
+                )
+                self.using_random_goal = True
+            else:
+                self.use_frontier_goal(
+                    self.goal_loc,
+                    reason="frontier_no_progress_replan",
+                )
+            stg_y, stg_x, replan, number_action = self._plan(
+                traversible,
+                self.goal_map,
+                self.full_pose,
+                cur_start,
+                cur_start_o,
+                False,
+            )
         
         # reach long-term goal and fbe
         if (not self.found_goal and not self.found_possible_goal and number_action == 0) or (self.using_random_goal and self.move_since_random > 20): 
@@ -4830,6 +5303,10 @@ class SG_Nav_Agent():
                 if number_action != 0:
                     self.scenegraph.debug_stats.inc("random_fallback_avoided_by_frontier")
                     break
+                self.add_frontier_blacklist(
+                    self.goal_loc,
+                    "frontier_planner_stop_rejected",
+                )
                 self.clear_fbe_free_region(self.goal_loc, radius_cells=4)
                 self.scenegraph.debug_stats.inc("frontier_planner_stop_rejected")
                 if self.loop_time > 20:
@@ -4910,6 +5387,9 @@ class SG_Nav_Agent():
                 if not (
                     self.stop_reason.startswith("stop_verification_confirmed")
                     or self.stop_reason.startswith(
+                        "stop_verification_near_goal_force_stop"
+                    )
+                    or self.stop_reason.startswith(
                         "stop_verification_high_confidence"
                     )
                 ):
@@ -4946,6 +5426,11 @@ class SG_Nav_Agent():
         c = int(np.clip(goal_loc[1], 0, self.map_size - 1))
         self.goal_map[r, c] = 1
         self.goal_map = self.goal_map[::-1]
+        goal_rc = np.asarray([r, c], dtype=np.float32)
+        self.last_selected_frontier_rc = goal_rc.copy()
+        self.frontier_goal_invalidated = False
+        if not self.same_frontier_goal(goal_rc, self.frontier_progress_goal_rc):
+            self.reset_frontier_progress_tracking(goal_rc)
         self.scenegraph.debug_stats.inc("frontier_goal_selected")
         self.scenegraph.debug_stats.inc(
             "frontier_goal_selected_" + "".join(
@@ -5007,6 +5492,216 @@ class SG_Nav_Agent():
         else:
             self.fbe_free_map[r0:r1, c0:c1] = 0
         return True
+
+    def reset_frontier_progress_tracking(self, goal_rc=None):
+        self.frontier_progress_goal_rc = (
+            np.asarray(goal_rc, dtype=np.float32).reshape(-1)[:2].copy()
+            if goal_rc is not None
+            else None
+        )
+        self.frontier_progress_best_distance_m = float("inf")
+        self.frontier_progress_no_improve_steps = 0
+        self.frontier_collision_goal_rc = (
+            np.asarray(goal_rc, dtype=np.float32).reshape(-1)[:2].copy()
+            if goal_rc is not None
+            else None
+        )
+        self.frontier_collision_block_count = 0
+
+    def same_frontier_goal(self, a, b, tolerance_cells=None):
+        if a is None or b is None:
+            return False
+        try:
+            a = np.asarray(a, dtype=np.float32).reshape(-1)[:2]
+            b = np.asarray(b, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            return False
+        if a.size != 2 or b.size != 2:
+            return False
+        if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
+            return False
+        if tolerance_cells is None:
+            tolerance_cells = max(2.0, float(self._map_radius_cells(0.30)))
+        return bool(np.linalg.norm(a - b) <= float(tolerance_cells))
+
+    def purge_frontier_blacklist(self):
+        if not getattr(self, "frontier_blacklist", None):
+            return
+        step = int(getattr(self, "total_steps", 0))
+        self.frontier_blacklist = [
+            item
+            for item in self.frontier_blacklist
+            if int(item.get("expires_step", -1)) >= step
+        ]
+
+    def add_frontier_blacklist(self, rc, reason):
+        if not getattr(self, "frontier_blacklist_enabled", True):
+            return False
+        try:
+            rc = np.asarray(rc, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            return False
+        if rc.size != 2 or not np.all(np.isfinite(rc)):
+            return False
+
+        self.purge_frontier_blacklist()
+        radius_m = float(self.frontier_blacklist_radius_m)
+        radius_cells = self._map_radius_cells(radius_m)
+        step = int(getattr(self, "total_steps", 0))
+        expires_step = step + int(self.frontier_blacklist_ttl_steps)
+        for item in getattr(self, "frontier_blacklist", []):
+            item_rc = np.asarray(item.get("rc", []), dtype=np.float32).reshape(-1)[:2]
+            if (
+                item_rc.size == 2
+                and np.all(np.isfinite(item_rc))
+                and np.linalg.norm(item_rc - rc) <= radius_cells
+            ):
+                item["expires_step"] = expires_step
+                item["reason"] = str(reason)
+                self.frontier_goal_invalidated = True
+                self.scenegraph.debug_stats.inc("frontier_blacklist_refreshed")
+                return False
+
+        item = {
+            "rc": rc.astype(float).tolist(),
+            "step": step,
+            "expires_step": expires_step,
+            "radius_m": radius_m,
+            "radius_cells": int(radius_cells),
+            "reason": str(reason),
+        }
+        self.frontier_blacklist.append(item)
+        self.frontier_goal_invalidated = True
+        self.reset_frontier_progress_tracking(None)
+        self.scenegraph.debug_stats.inc("frontier_blacklist_added")
+        self.log_candidate_event(
+            "frontier_blacklist",
+            decision="blacklist",
+            reason=reason,
+            frontier_rc=rc.astype(float).tolist(),
+            frontier_blacklist_radius_m=radius_m,
+            frontier_blacklist_radius_cells=int(radius_cells),
+            frontier_blacklist_ttl_steps=int(self.frontier_blacklist_ttl_steps),
+            frontier_blacklist_count=len(self.frontier_blacklist),
+        )
+        return True
+
+    def frontier_blacklist_mask(self, frontier_rcs):
+        frontier_rcs = np.asarray(frontier_rcs, dtype=np.float32)
+        if frontier_rcs.size == 0:
+            return np.zeros((0,), dtype=bool)
+        frontier_rcs = frontier_rcs.reshape(-1, 2)
+        mask = np.zeros((frontier_rcs.shape[0],), dtype=bool)
+        if not getattr(self, "frontier_blacklist_enabled", True):
+            return mask
+        self.purge_frontier_blacklist()
+        for item in getattr(self, "frontier_blacklist", []):
+            try:
+                rc = np.asarray(item.get("rc", []), dtype=np.float32).reshape(-1)[:2]
+            except Exception:
+                continue
+            if rc.size != 2 or not np.all(np.isfinite(rc)):
+                continue
+            radius_cells = int(
+                item.get(
+                    "radius_cells",
+                    self._map_radius_cells(item.get("radius_m", self.frontier_blacklist_radius_m)),
+                )
+            )
+            mask |= np.linalg.norm(frontier_rcs - rc, axis=1) <= radius_cells
+        return mask
+
+    def current_frontier_goal_rc(self):
+        goal_rc = getattr(self, "goal_loc", None)
+        if goal_rc is None:
+            goal_rc = getattr(self, "last_selected_frontier_rc", None)
+        if goal_rc is None:
+            return None
+        try:
+            goal_rc = np.asarray(goal_rc, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            return None
+        if goal_rc.size != 2 or not np.all(np.isfinite(goal_rc)):
+            return None
+        return goal_rc
+
+    def note_frontier_collision_block(self, reason="local_stg_collision_block"):
+        if not getattr(self, "frontier_blacklist_enabled", True):
+            return False
+        if (
+            self.found_goal
+            or self.found_possible_goal
+            or self.reperception_active
+            or self.stop_verification_active
+            or self.using_random_goal
+        ):
+            return False
+        goal_rc = self.current_frontier_goal_rc()
+        if goal_rc is None:
+            return False
+        if self.same_frontier_goal(goal_rc, self.frontier_collision_goal_rc):
+            self.frontier_collision_block_count += 1
+        else:
+            self.frontier_collision_goal_rc = goal_rc.copy()
+            self.frontier_collision_block_count = 1
+        self.scenegraph.debug_stats.inc("frontier_collision_block_seen")
+        if self.frontier_collision_block_count < self.frontier_blacklist_collision_blocks:
+            return False
+        added = self.add_frontier_blacklist(goal_rc, reason)
+        self.frontier_collision_block_count = 0
+        if added:
+            self.scenegraph.debug_stats.inc("frontier_blacklist_from_collision")
+        return added
+
+    def maybe_blacklist_frontier_no_progress(self, cur_start):
+        if not getattr(self, "frontier_blacklist_enabled", True):
+            return False
+        if (
+            self.found_goal
+            or self.found_possible_goal
+            or self.reperception_active
+            or self.stop_verification_active
+            or self.using_random_goal
+        ):
+            return False
+        goal_rc = self.current_frontier_goal_rc()
+        if goal_rc is None:
+            return False
+        try:
+            start_rc = np.asarray(cur_start, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            return False
+        if start_rc.size != 2 or not np.all(np.isfinite(start_rc)):
+            return False
+        if not self.same_frontier_goal(goal_rc, self.frontier_progress_goal_rc):
+            self.frontier_progress_goal_rc = goal_rc.copy()
+            self.frontier_progress_best_distance_m = float("inf")
+            self.frontier_progress_no_improve_steps = 0
+
+        dist_m = float(np.linalg.norm(goal_rc - start_rc) * self.map_resolution / 100.0)
+        if (
+            not np.isfinite(self.frontier_progress_best_distance_m)
+            or self.frontier_progress_best_distance_m - dist_m
+            >= self.frontier_progress_min_delta_m
+        ):
+            self.frontier_progress_best_distance_m = dist_m
+            self.frontier_progress_no_improve_steps = 0
+            return False
+
+        self.frontier_progress_no_improve_steps += 1
+        if (
+            self.frontier_progress_no_improve_steps
+            < self.frontier_blacklist_no_progress_steps
+        ):
+            return False
+
+        added = self.add_frontier_blacklist(
+            goal_rc,
+            f"frontier_no_progress_{self.frontier_blacklist_no_progress_steps}_steps",
+        )
+        if added:
+            self.scenegraph.debug_stats.inc("frontier_blacklist_from_no_progress")
+        return added
 
     def apply_stuck_position_blacklist_to_fbe_free_map(self):
         if not getattr(self, "stuck_position_blacklist", []):
@@ -5158,6 +5853,9 @@ class SG_Nav_Agent():
         frontier_locations = torch.stack([torch.where(frontier_map)[0], torch.where(frontier_map)[1]]).T
         num_frontiers = len(torch.where(frontier_map)[0])
         if num_frontiers == 0:
+            self.frontier_locations = np.empty((0, 2), dtype=np.float32)
+            self.frontier_locations_16 = np.empty((0, 2), dtype=np.float32)
+            self.last_selected_frontier_rc = None
             self.fbe_frontier_count_valid_history.append(0)
             self.log_fbe_trace({
                 "step": int(self.total_steps),
@@ -5199,14 +5897,30 @@ class SG_Nav_Agent():
         distances = fmm_dist[frontier_locations[:,0],frontier_locations[:,1]] / 20
         
         # Keep all reachable frontiers. Close frontiers should be allowed to win
-        # when the scene graph score says they are promising.
-        idx_16 = np.where(np.isfinite(distances))
+        # when the scene graph score says they are promising. Frontiers that
+        # repeatedly block local planning are cooled down before scoring.
+        reachable_frontier_mask = np.isfinite(distances)
+        frontier_blacklisted_mask = self.frontier_blacklist_mask(
+            frontier_locations - 1
+        )
+        frontier_candidate_mask = reachable_frontier_mask & ~frontier_blacklisted_mask
+        frontier_blacklist_released_all = False
+        if (
+            not np.any(frontier_candidate_mask)
+            and np.any(reachable_frontier_mask)
+        ):
+            frontier_candidate_mask = reachable_frontier_mask
+            frontier_blacklist_released_all = True
+            self.scenegraph.debug_stats.inc("frontier_blacklist_released_all")
+        idx_16 = np.where(frontier_candidate_mask)
         distances_16 = distances[idx_16]
         distances_16_inverse = 1 - (np.clip(distances_16,1.6,11.6)-1.6) / (11.6-1.6)
         frontier_locations_16 = frontier_locations[idx_16]
         self.frontier_locations = frontier_locations
         self.frontier_locations_16 = frontier_locations_16
         if len(distances_16) == 0:
+            self.frontier_locations_16 = np.empty((0, 2), dtype=np.float32)
+            self.last_selected_frontier_rc = None
             self.fbe_frontier_count_valid_history.append(0)
             self.log_fbe_trace({
                 "step": int(self.total_steps),
@@ -5229,6 +5943,9 @@ class SG_Nav_Agent():
                 "fmm_dist_selected": None,
                 "fmm_finite_ratio": fmm_finite_ratio,
                 "traversible_connected_component_size": fmm_finite_count,
+                "frontier_blacklist_count": len(getattr(self, "frontier_blacklist", [])),
+                "frontier_count_blacklisted": int(np.count_nonzero(frontier_blacklisted_mask)),
+                "frontier_blacklist_released_all": bool(frontier_blacklist_released_all),
                 "used_random_goal": True,
                 "reason": "no_reachable_frontiers",
                 "fallback_reason": "no_reachable_frontiers",
@@ -5252,6 +5969,7 @@ class SG_Nav_Agent():
         scenegraph_changed_selection = selected_valid_idx != distance_only_valid_idx
         idx_16_max = idx_16[0][selected_valid_idx]
         goal = frontier_locations[idx_16_max] - 1
+        self.last_selected_frontier_rc = np.asarray(goal, dtype=np.float32).copy()
         self.scores = scores
         top5_frontiers = []
         for valid_idx in np.argsort(scores)[::-1][:5]:
@@ -5321,6 +6039,9 @@ class SG_Nav_Agent():
             "fmm_dist_selected": float(fmm_dist[frontier_locations[idx_16_max][0], frontier_locations[idx_16_max][1]]),
             "fmm_finite_ratio": fmm_finite_ratio,
             "traversible_connected_component_size": fmm_finite_count,
+            "frontier_blacklist_count": len(getattr(self, "frontier_blacklist", [])),
+            "frontier_count_blacklisted": int(np.count_nonzero(frontier_blacklisted_mask)),
+            "frontier_blacklist_released_all": bool(frontier_blacklist_released_all),
             "used_random_goal": False,
             "reason": "selected_frontier",
             "fallback_reason": None,
@@ -5427,6 +6148,183 @@ class SG_Nav_Agent():
             type_mask[idx,box[1]:box[3],box[0]:box[2]] = 1
             score_vec[idx] = room_prediction_result.get_field("scores")[i]
         self.room_map = self.room_map_module(torch.squeeze(torch.from_numpy(observations['depth']), dim=-1).to(self.device), self.full_pose, self.room_map, torch.from_numpy(type_mask).to(self.device).type(torch.float32), score_vec)
+
+    def same_short_term_goal(self, a, b, tolerance_cells=None):
+        if a is None or b is None:
+            return False
+        try:
+            a = np.asarray(a, dtype=np.float32).reshape(-1)[:2]
+            b = np.asarray(b, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            return False
+        if a.size != 2 or b.size != 2:
+            return False
+        if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
+            return False
+        if tolerance_cells is None:
+            tolerance_cells = self.local_stg_collision_same_tolerance_cells
+        return bool(np.linalg.norm(a - b) <= float(tolerance_cells))
+
+    def purge_local_stg_collision_blocks(self):
+        if not getattr(self, "local_stg_collision_blocks", None):
+            return
+        step = int(getattr(self, "total_steps", 0))
+        self.local_stg_collision_blocks = [
+            block
+            for block in self.local_stg_collision_blocks
+            if int(block.get("expires_step", -1)) >= step
+        ]
+
+    def add_local_stg_collision_block(
+        self,
+        stg_rc,
+        start=None,
+        start_o=None,
+        reason="local_stg_forward_collision",
+    ):
+        try:
+            rc = np.asarray(stg_rc, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            return None
+        if rc.size != 2 or not np.all(np.isfinite(rc)):
+            return None
+
+        radius = int(self.local_stg_collision_radius_cells)
+        if start is not None:
+            try:
+                start_rc = np.asarray(start, dtype=np.float32).reshape(-1)[:2]
+            except Exception:
+                start_rc = None
+            if (
+                start_rc is not None
+                and start_rc.size == 2
+                and np.all(np.isfinite(start_rc))
+                and np.linalg.norm(rc - start_rc) <= max(2.0, radius * 0.75)
+            ):
+                try:
+                    theta = np.deg2rad(float(start_o))
+                    forward_cells = max(float(radius + 2), 4.0)
+                    rc = start_rc + np.array(
+                        [
+                            np.sin(theta) * forward_cells,
+                            np.cos(theta) * forward_cells,
+                        ],
+                        dtype=np.float32,
+                    )
+                    reason = f"{reason}_forward_projection"
+                except Exception:
+                    pass
+
+        rc[0] = np.clip(rc[0], 0, self.collision_map.shape[0] - 1)
+        rc[1] = np.clip(rc[1], 0, self.collision_map.shape[1] - 1)
+        self.purge_local_stg_collision_blocks()
+        for block in getattr(self, "local_stg_collision_blocks", []):
+            block_rc = np.asarray(block.get("rc", []), dtype=np.float32)
+            if block_rc.size == 2 and np.linalg.norm(block_rc - rc) <= radius:
+                block["expires_step"] = (
+                    int(getattr(self, "total_steps", 0))
+                    + int(self.local_stg_collision_ttl_steps)
+                )
+                self.note_frontier_collision_block(reason=reason)
+                return block
+
+        block = {
+            "rc": rc.astype(float).tolist(),
+            "step": int(getattr(self, "total_steps", 0)),
+            "expires_step": int(getattr(self, "total_steps", 0))
+            + int(self.local_stg_collision_ttl_steps),
+            "radius_cells": radius,
+            "reason": reason,
+        }
+        self.local_stg_collision_blocks.append(block)
+        self.scenegraph.debug_stats.inc("local_stg_collision_block_added")
+        self.log_candidate_event(
+            "local_stg_collision_block",
+            decision="replan",
+            reason=reason,
+            local_stg_rc=rc.astype(float).tolist(),
+            local_stg_collision_count=int(self.local_stg_collision_count),
+            local_stg_collision_threshold=int(self.local_stg_collision_threshold),
+            local_stg_collision_radius_cells=radius,
+            local_stg_collision_ttl_steps=int(self.local_stg_collision_ttl_steps),
+        )
+        self.note_frontier_collision_block(reason=reason)
+        return block
+
+    def apply_local_stg_collision_blocks_to_traversible(self, traversible, start=None):
+        if not self.local_stg_collision_recovery_enabled:
+            return 0
+        self.purge_local_stg_collision_blocks()
+        blocks = getattr(self, "local_stg_collision_blocks", [])
+        if not blocks:
+            return 0
+        height, width = traversible.shape
+        applied = 0
+        for block in blocks:
+            try:
+                rc = np.asarray(block.get("rc", []), dtype=np.float32).reshape(-1)[:2]
+            except Exception:
+                continue
+            if rc.size != 2 or not np.all(np.isfinite(rc)):
+                continue
+            radius = int(block.get("radius_cells", self.local_stg_collision_radius_cells))
+            row = int(round(float(rc[0]))) + 1
+            col = int(round(float(rc[1]))) + 1
+            r0 = max(0, row - radius)
+            r1 = min(height, row + radius + 1)
+            c0 = max(0, col - radius)
+            c1 = min(width, col + radius + 1)
+            if r0 >= r1 or c0 >= c1:
+                continue
+            traversible[r0:r1, c0:c1] = 0
+            applied += 1
+
+        if start is not None:
+            try:
+                start_rc = np.asarray(start, dtype=np.int64).reshape(-1)[:2]
+                clearance = int(self.agent_footprint_clearance_cells)
+                row = int(start_rc[0]) + 1
+                col = int(start_rc[1]) + 1
+                r0 = max(0, row - clearance)
+                r1 = min(height, row + clearance + 1)
+                c0 = max(0, col - clearance)
+                c1 = min(width, col + clearance + 1)
+                traversible[r0:r1, c0:c1] = 1
+            except Exception:
+                pass
+        return applied
+
+    def handle_local_stg_forward_collision(self, start=None, start_o=None):
+        if not self.local_stg_collision_recovery_enabled:
+            return False
+        if int(getattr(self, "last_short_term_goal_action", 0)) != 1:
+            return False
+        if int(getattr(self, "last_short_term_goal_step", -1)) != int(self.total_steps) - 1:
+            return False
+        stg_rc = getattr(self, "last_short_term_goal_rc", None)
+        if stg_rc is None:
+            return False
+        if self.same_short_term_goal(stg_rc, self.local_stg_collision_stg_rc):
+            self.local_stg_collision_count += 1
+        else:
+            self.local_stg_collision_stg_rc = np.asarray(
+                stg_rc, dtype=np.float32
+            ).copy()
+            self.local_stg_collision_count = 1
+        self.scenegraph.debug_stats.inc("local_stg_forward_collision")
+        if self.local_stg_collision_count < self.local_stg_collision_threshold:
+            return False
+        block = self.add_local_stg_collision_block(
+            stg_rc,
+            start=start,
+            start_o=start_o,
+            reason="same_stg_forward_collision",
+        )
+        if block is None:
+            return False
+        self.local_stg_collision_count = 0
+        self.scenegraph.debug_stats.inc("local_stg_collision_replan")
+        return True
     
     def get_traversible(self, map_pred, pose_pred):
         grid = np.rint(map_pred).astype(np.float32, copy=True)
@@ -5511,6 +6409,7 @@ class SG_Nav_Agent():
         goal_found,
         stop_distance_m=None,
     ):
+        local_collision_recovery = False
         if self.prev_action == 1:
             x1, y1, t1 = self.last_loc.cpu().numpy()
             x2, y2, t2 = self.full_pose.cpu()
@@ -5534,11 +6433,26 @@ class SG_Nav_Agent():
                     c = int(round(c * 100 / self.map_resolution))
                     [r, c] = pu.threshold_poses([r, c], self.collision_map.shape)
                     self.collision_map[r,c] = 1
+                local_collision_recovery = self.handle_local_stg_forward_collision(
+                    start=start,
+                    start_o=start_o,
+                )
             else:
                 self.former_collide = 0
+                self.local_stg_collision_count = 0
+                self.local_stg_collision_stg_rc = None
 
+        traversible_for_plan = np.array(traversible, copy=True)
+        local_blocks_applied = self.apply_local_stg_collision_blocks_to_traversible(
+            traversible_for_plan,
+            start=start,
+        )
+        if local_blocks_applied > 0:
+            self.scenegraph.debug_stats.inc("local_stg_collision_block_applied")
+            if local_collision_recovery:
+                self.scenegraph.debug_stats.inc("local_stg_collision_immediate_replan")
         stg, replan, stop, = self._get_stg(
-            traversible,
+            traversible_for_plan,
             start,
             np.copy(goal_map),
             goal_found,
@@ -5579,7 +6493,15 @@ class SG_Nav_Agent():
                 self.former_collide  = 0
             if stg_y == start[0] and stg_x == start[1]:
                 action = 1
+            if local_collision_recovery and action == 1:
+                action = 3 if int(self.total_steps) % 2 == 0 else 2
+                self.scenegraph.debug_stats.inc("local_stg_collision_forced_turn")
 
+        self.last_short_term_goal_rc = np.asarray(
+            [stg_y, stg_x], dtype=np.float32
+        )
+        self.last_short_term_goal_action = int(action)
+        self.last_short_term_goal_step = int(getattr(self, "total_steps", -1))
         return stg_y, stg_x, replan, action
     
     def _get_stg(
@@ -5742,6 +6664,42 @@ class SG_Nav_Agent():
             "candidate_progress_no_improve_steps": int(
                 self.candidate_progress_no_improve_steps
             ),
+            "local_stg_collision_recovery_enabled": bool(
+                self.local_stg_collision_recovery_enabled
+            ),
+            "local_stg_collision_threshold": int(
+                self.local_stg_collision_threshold
+            ),
+            "local_stg_collision_radius_cells": int(
+                self.local_stg_collision_radius_cells
+            ),
+            "local_stg_collision_ttl_steps": int(
+                self.local_stg_collision_ttl_steps
+            ),
+            "local_stg_collision_blocks": list(
+                getattr(self, "local_stg_collision_blocks", [])
+            ),
+            "frontier_blacklist_enabled": bool(self.frontier_blacklist_enabled),
+            "frontier_blacklist_radius_m": float(self.frontier_blacklist_radius_m),
+            "frontier_blacklist_ttl_steps": int(
+                self.frontier_blacklist_ttl_steps
+            ),
+            "frontier_blacklist_collision_blocks": int(
+                self.frontier_blacklist_collision_blocks
+            ),
+            "frontier_blacklist_no_progress_steps": int(
+                self.frontier_blacklist_no_progress_steps
+            ),
+            "frontier_progress_min_delta_m": float(
+                self.frontier_progress_min_delta_m
+            ),
+            "frontier_blacklist": list(getattr(self, "frontier_blacklist", [])),
+            "frontier_progress_no_improve_steps": int(
+                self.frontier_progress_no_improve_steps
+            ),
+            "frontier_collision_block_count": int(
+                self.frontier_collision_block_count
+            ),
             "stuck_position_blacklist": [
                 {
                     **item,
@@ -5819,6 +6777,15 @@ class SG_Nav_Agent():
             ),
             "stop_verification_required_hit_max_distance_m": float(
                 self.stop_verification_required_hit_max_distance_m
+            ),
+            "near_goal_force_stop_enabled": bool(
+                self.near_goal_force_stop_enabled
+            ),
+            "near_goal_force_stop_distance_m": float(
+                self.near_goal_force_stop_distance_m
+            ),
+            "near_goal_force_stop_min_approach_steps": int(
+                self.near_goal_force_stop_min_approach_steps
             ),
             "stop_verification_anchor_radius_m": float(
                 self.stop_verification_anchor_radius_m
@@ -6046,25 +7013,41 @@ class SG_Nav_Agent():
             obstacle_rgb = colors.to_rgb('#A2A2A2')
             paper_map_trans[skimage.morphology.binary_dilation(self.full_map.cpu().numpy()[0,0,::-1]>0.5,skimage.morphology.disk(1)),:] = torch.tensor(obstacle_rgb).double()
             paper_map_trans = paper_map_trans.permute(2,0,1)
+            self.draw_unselected_frontiers_on_map(paper_map_trans)
             self.visualize_agent_and_goal(paper_map_trans)
+            if getattr(self, "found_possible_goal", False):
+                self.draw_gps_marker_on_map(
+                    paper_map_trans,
+                    self.possible_goal_temp_gps,
+                    color=(1.0, 0.0, 0.0),
+                    radius=5,
+                )
             agent_coordinate = (int(self.history_pose[-1][0]*100/self.resolution), int((self.map_size_cm/100-self.history_pose[-1][1])*100/self.resolution))
             occupancy_map = crop_around_point((paper_map_trans.permute(1, 2, 0) * 255).numpy().astype(np.uint8), agent_coordinate, (150, 200))
-            visualize_image = np.full((450, 800, 3), 255, dtype=np.uint8)
-            visualize_image = add_resized_image(visualize_image, self.rgb_visualization, (10, 60), (320, 240))
-            visualize_image = add_resized_image(visualize_image, occupancy_map, (340, 60), (180, 240))
-            visualize_image = add_rectangle(visualize_image, (10, 60), (330, 300), (128, 128, 128), thickness=1)
-            visualize_image = add_rectangle(visualize_image, (340, 60), (520, 300), (128, 128, 128), thickness=1)
-            visualize_image = add_rectangle(visualize_image, (540, 60), (790, 165), (128, 128, 128), thickness=1)
-            visualize_image = add_rectangle(visualize_image, (540, 195), (790, 300), (128, 128, 128), thickness=1)
-            visualize_image = add_rectangle(visualize_image, (10, 350), (790, 400), (128, 128, 128), thickness=1)
-            visualize_image = add_text(visualize_image, "Observation (Goal: {})".format(self.obj_goal), (70, 50), font_scale=0.5, thickness=1)
-            visualize_image = add_text(visualize_image, "Occupancy Map", (370, 50), font_scale=0.5, thickness=1)
-            visualize_image = add_text(visualize_image, "Scene Graph Nodes", (580, 50), font_scale=0.5, thickness=1)
-            visualize_image = add_text(visualize_image, "Scene Graph Edges", (580, 185), font_scale=0.5, thickness=1)
-            visualize_image = add_text(visualize_image, "LLM Explanation", (330, 340), font_scale=0.5, thickness=1)
-            visualize_image = add_text_list(visualize_image, line_list(self.text_node, 40), (550, 80), font_scale=0.3, thickness=1)
-            visualize_image = add_text_list(visualize_image, line_list(self.text_edge, 40), (550, 215), font_scale=0.3, thickness=1)
-            visualize_image = add_text_list(visualize_image, line_list(self.explanation, 150), (20, 370), font_scale=0.3, thickness=1)
+            observation_image = self.observation_with_visual_overlays()
+            visualize_image = np.full((760, 1280, 3), 255, dtype=np.uint8)
+            visualize_image = add_resized_image(visualize_image, observation_image, (20, 70), (640, 480))
+            visualize_image = add_resized_image(visualize_image, occupancy_map, (690, 70), (300, 400))
+            visualize_image = add_rectangle(visualize_image, (20, 70), (660, 550), (128, 128, 128), thickness=1)
+            visualize_image = add_rectangle(visualize_image, (690, 70), (990, 470), (128, 128, 128), thickness=1)
+            visualize_image = add_rectangle(visualize_image, (1010, 70), (1260, 250), (128, 128, 128), thickness=1)
+            visualize_image = add_rectangle(visualize_image, (1010, 280), (1260, 470), (128, 128, 128), thickness=1)
+            visualize_image = add_rectangle(visualize_image, (690, 500), (1260, 550), (128, 128, 128), thickness=1)
+            visualize_image = add_rectangle(visualize_image, (20, 600), (1260, 735), (128, 128, 128), thickness=1)
+            visualize_image = add_text(visualize_image, "Observation + detections (Goal: {})".format(self.obj_goal), (170, 50), font_scale=0.65, thickness=2)
+            visualize_image = add_text(visualize_image, "Occupancy Map", (770, 50), font_scale=0.65, thickness=2)
+            visualize_image = add_text(visualize_image, "Scene Graph Nodes", (1040, 50), font_scale=0.55, thickness=1)
+            visualize_image = add_text(visualize_image, "Scene Graph Edges", (1040, 270), font_scale=0.55, thickness=1)
+            visualize_image = add_text(visualize_image, "Status", (705, 492), font_scale=0.55, thickness=1)
+            visualize_image = add_text(visualize_image, "LLM Explanation", (560, 590), font_scale=0.6, thickness=1)
+            visualize_image = add_text_list(visualize_image, line_list(self.text_node, 36), (1020, 95), font_scale=0.32, thickness=1)
+            visualize_image = add_text_list(visualize_image, line_list(self.text_edge, 36), (1020, 305), font_scale=0.32, thickness=1)
+            status_text = (
+                f"red dot/box: possible goal | boxes show label/conf | "
+                f"state: {'found' if self.found_goal else 'possible' if self.found_possible_goal else 'exploring'}"
+            )
+            visualize_image = add_text_list(visualize_image, line_list(status_text, 88), (705, 525), font_scale=0.4, thickness=1)
+            visualize_image = add_text_list(visualize_image, line_list(self.explanation, 220), (30, 625), font_scale=0.4, thickness=1)
             visualize_image = visualize_image[:, :, ::-1]
             if self.args.visualize:
                 self.visualize_image_list.append(visualize_image)
@@ -6262,6 +7245,39 @@ def main():
         "--candidate_progress_min_delta_m", default=0.10, type=float
     )
     parser.add_argument(
+        "--local_stg_collision_recovery_enabled", default=1, type=int
+    )
+    parser.add_argument(
+        "--local_stg_collision_threshold", default=3, type=int
+    )
+    parser.add_argument(
+        "--local_stg_collision_radius_cells", default=4, type=int
+    )
+    parser.add_argument(
+        "--local_stg_collision_ttl_steps", default=20, type=int
+    )
+    parser.add_argument(
+        "--local_stg_collision_same_tolerance_cells", default=2.0, type=float
+    )
+    parser.add_argument(
+        "--frontier_blacklist_enabled", default=1, type=int
+    )
+    parser.add_argument(
+        "--frontier_blacklist_radius_m", default=1.5, type=float
+    )
+    parser.add_argument(
+        "--frontier_blacklist_ttl_steps", default=120, type=int
+    )
+    parser.add_argument(
+        "--frontier_blacklist_collision_blocks", default=3, type=int
+    )
+    parser.add_argument(
+        "--frontier_blacklist_no_progress_steps", default=35, type=int
+    )
+    parser.add_argument(
+        "--frontier_progress_min_delta_m", default=0.10, type=float
+    )
+    parser.add_argument(
         "--invalid_episode_stuck_steps", default=200, type=int
     )
     parser.add_argument(
@@ -6298,6 +7314,15 @@ def main():
         "--stop_verification_required_hit_max_distance_m", default=1.5, type=float
     )
     parser.add_argument(
+        "--near_goal_force_stop_enabled", default=1, type=int
+    )
+    parser.add_argument(
+        "--near_goal_force_stop_distance_m", default=1.0, type=float
+    )
+    parser.add_argument(
+        "--near_goal_force_stop_min_approach_steps", default=12, type=int
+    )
+    parser.add_argument(
         "--stop_verification_anchor_radius_m", default=0.8, type=float
     )
     parser.add_argument(
@@ -6325,10 +7350,10 @@ def main():
         "--direct_goal_approach_max_steps", default=20, type=int
     )
     parser.add_argument(
-        "--goal_detection_min_confidence", default=0.60, type=float
+        "--goal_detection_min_confidence", default=0.62, type=float
     )
     parser.add_argument(
-        "--candidate_start_min_confidence", default=0.60, type=float
+        "--candidate_start_min_confidence", default=0.62, type=float
     )
     parser.add_argument(
         "--planned_goal_approach_enabled", default=1, type=int
@@ -6355,13 +7380,13 @@ def main():
         "--planned_goal_retreat_enabled", default=1, type=int
     )
     parser.add_argument(
-        "--planned_goal_retreat_min_radius_m", default=1.20, type=float
+        "--planned_goal_retreat_min_radius_m", default=1.00, type=float
     )
     parser.add_argument(
         "--planned_goal_retreat_max_radius_m", default=1.50, type=float
     )
     parser.add_argument(
-        "--planned_goal_retreat_require_line_of_sight", default=1, type=int
+        "--planned_goal_retreat_require_line_of_sight", default=0, type=int
     )
     parser.add_argument(
         "--planned_goal_retreat_los_endpoint_skip_cells", default=2, type=int
@@ -6394,7 +7419,7 @@ def main():
         "--candidate_strong_evidence_min_hits", type=int, default=None
     )
     parser.add_argument(
-        "--candidate_strong_evidence_min_consecutive_hits", type=int, default=6
+        "--candidate_strong_evidence_min_consecutive_hits", type=int, default=3
     )
     parser.add_argument(
         "--candidate_min_distinct_views", type=int, default=1
