@@ -4030,6 +4030,12 @@ class SG_Nav_Agent():
             and self.stop_verification_observation_count >= max(1, self.stop_verification_steps)
         )
         enough_hits = cumulative_evidence_hits >= self.stop_verification_min_hits
+        candidate_near_stop_evidence = bool(
+            close_to_target
+            and candidate_support["matches"]
+            and candidate_evidence_hits >= self.stop_verification_min_hits
+            and candidate_near_hits > 0
+        )
         current_verified_stop_evidence = bool(
             current_verified_hit
             and enough_hits
@@ -4048,12 +4054,14 @@ class SG_Nav_Agent():
             current_verified_stop_evidence
             or high_confidence_current_hit
             or strong_consecutive_evidence
+            or candidate_near_stop_evidence
             or retreat_confirmed_evidence
             or (weak_historical_stop and close_to_target)
         )
         near_visual_hit_ready = bool(
             (not self.stop_require_near_visual_hit)
             or current_near_verified_hit
+            or candidate_near_stop_evidence
             or strong_consecutive_evidence
             or high_confidence_current_hit
             or retreat_confirmed_evidence
@@ -4175,6 +4183,9 @@ class SG_Nav_Agent():
             self.stop_verification_history[-1][
                 "current_verified_stop_evidence"
             ] = bool(current_verified_stop_evidence)
+            self.stop_verification_history[-1][
+                "candidate_near_stop_evidence"
+            ] = bool(candidate_near_stop_evidence)
             self.stop_verification_history[-1][
                 "raw_enough_evidence"
             ] = bool(raw_enough_evidence)
@@ -4364,6 +4375,7 @@ class SG_Nav_Agent():
             stop_decision_supported = bool(
                 current_verified_stop_evidence
                 or strong_consecutive_evidence
+                or candidate_near_stop_evidence
                 or retreat_confirmed_evidence
                 or high_confidence_current_hit
             )
